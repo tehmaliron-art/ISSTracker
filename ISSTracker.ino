@@ -86,9 +86,15 @@ const int SERVO_MIN_US = 500;
 const int SERVO_MAX_US = 2400;
 
 // ---------------------- OBSERVER LOCATION ----------------------
-static const double OBS_LAT_DEG = 35.3733;
-static const double OBS_LON_DEG = -119.0187;
-static const double OBS_ALT_M   = 120.0;
+// Defaults (Bakersfield-ish). These are persisted in NVS once changed via UI.
+static const double OBS_LAT_DEFAULT_DEG = 35.3733;
+static const double OBS_LON_DEFAULT_DEG = -119.0187;
+static const double OBS_ALT_DEFAULT_M   = 120.0;
+
+// Runtime (mutable) observer location used by ISS tracking math.
+double obsLatDeg = OBS_LAT_DEFAULT_DEG;
+double obsLonDeg = OBS_LON_DEFAULT_DEG;
+double obsAltM    = OBS_ALT_DEFAULT_M;
 
 // ---------------------- ISS API ----------------------
 static const char* ISS_URL = "https://api.wheretheiss.at/v1/satellites/25544";
@@ -523,7 +529,7 @@ void issTask(void* pv) {
       issAltM   = altM;
 
       double az, el;
-      computeAzElDeg(OBS_LAT_DEG, OBS_LON_DEG, OBS_ALT_M,
+      computeAzElDeg(obsLatDeg, obsLonDeg, obsAltM,
                      lat, lon, altM,
                      az, el);
 
@@ -635,7 +641,7 @@ void setupOTA() {
 // ---------------------- WEB UI ----------------------
 String htmlPage() {
   String s;
-  s.reserve(9000);
+  s.reserve(12000);
 
   s += R"HTML(
 <!doctype html><html>
@@ -652,20 +658,38 @@ String htmlPage() {
   .label { min-width: 140px; font-weight: 600; }
   input[type=range] { width: 260px; }
   code { background: #f3f3f3; padding: 2px 6px; border-radius: 6px; }
+
+  .controlsTop { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  .dpad { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .dpadMid { display: flex; align-items: center; gap: 6px; }
+  .dpadBtn { width: 56px; height: 46px; font-size: 20px; padding: 0; }
+  .dpadCenter { width: 56px; height: 46px; }
+  .sideBtns { display: flex; flex-direction: column; gap: 8px; }
+  .statusGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .text { width: 120px; padding: 10px 10px; border-radius: 10px; border: 1px solid #aaa; background: #fff; }
+  @media (max-width: 720px) { .statusGrid { grid-template-columns: 1fr; } .sideBtns { flex-direction: row; } }
+
 </style>
 </head>
 <body>
 <h2>ISS Tracker Bench UI</h2>
 
 <div class="card">
-  <div class="row">
-    <button onclick="api('/api/home')">Home Azimuth</button>
-    <button onclick="api('/api/set_north')">Set North (I'm pointing North)</button>
-  </div>
-  <div class="row">
-    <button onclick="api('/api/jog?dir=-1')">Jog Left</button>
-    <button onclick="api('/api/jog?dir=+1')">Jog Right</button>
-    <button onclick="api('/api/stop')">Stop</button>
+  <div class="controlsTop">
+    <div class="dpad">
+      <button class="dpadBtn" onclick="nudgeServo(+5)" title="Up">▲</button>
+      <div class="dpadMid">
+        <button class="dpadBtn" onclick="api('/api/jog?dir=-1')" title="Left">◀</button>
+        <div class="dpadCenter"></div>
+        <button class="dpadBtn" onclick="api('/api/jog?dir=+1')" title="Right">▶</button>
+      </div>
+      <button class="dpadBtn" onclick="nudgeServo(-5)" title="Down">▼</button>
+    </div>
+
+    <div class="sideBtns">
+      <button onclick="api('/api/home')">Home</button>
+      <button onclick="api('/api/set_north')">Set North</button>
+    </div>
   </div>
 </div>
 
@@ -689,7 +713,23 @@ String htmlPage() {
 
 <div class="card">
   <h3>Status</h3>
-  <div id="status">Loading...</div>
+  <div class="statusGrid">
+    <div id="statusL">Loading...</div>
+    <div id="statusR"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Observer</h3>
+  <div class="row">
+    <div class="label">Lat</div><input id="obsLat" class="text" inputmode="decimal">
+    <div class="label">Lon</div><input id="obsLon" class="text" inputmode="decimal">
+    <div class="label">Alt (m)</div><input id="obsAlt" class="text" inputmode="decimal">
+    <button onclick="saveObserver()">Save</button>
+  </div>
+  <div style="font-size: 0.9em; opacity: 0.8; margin-top: 8px;">
+    Saving observer location stops tracking and switches to manual mode.
+  </div>
 </div>
 
 <script>
@@ -699,32 +739,66 @@ async function setServo(v){
   await fetch('/api/servo?angle=' + encodeURIComponent(v));
 }
 
-function renderStatus(j){
-  const lines = [];
-  lines.push(`<b>WiFi:</b> ${j.wifiMode} ${j.ip} (RSSI ${j.rssi})`);
-  lines.push(`<b>Tracking:</b> ${j.tracking} &nbsp; <b>ManualOverride:</b> ${j.manualOverride}`);
-  lines.push(`<b>Homed:</b> ${j.homed} &nbsp; <b>HomeState:</b> ${j.homeState}`);
-  lines.push(`<b>Hall:</b> raw=${j.hallRaw} active=${j.hallActive}`);
-  lines.push(`<b>Az steps:</b> ${j.azSteps}`);
-  lines.push(`<b>Az deg (north-ref):</b> ${j.azDeg.toFixed(2)}&deg;`);
-  lines.push(`<b>North offset steps:</b> ${j.northOffset}`);
-  lines.push(`<b>Servo:</b> ${j.servoAngle}&deg; (pulse ${j.servoPulse}us)`);
-  lines.push(`<b>ISS:</b> ${j.issLat.toFixed(3)}, ${j.issLon.toFixed(3)} alt ${Math.round(j.issAltM)}m`);
-  lines.push(`<b>Target Az/El:</b> ${j.tAz.toFixed(2)}&deg; / ${j.tEl.toFixed(2)}&deg;`);
-  lines.push(`<b>Poll:</b> ${j.pollMs}ms &nbsp; <b>FAST:</b> ${j.fastMode}`);
-  lines.push(`<b>Uptime:</b> ${Math.floor(j.uptimeMs/1000)}s`);
-  lines.push(`<b>ISS HTTP:</b> ${j.issHttp} &nbsp; <b>Age:</b> ${Math.floor(j.issAgeMs/1000)}s`);
-  if (j.issErr && j.issErr.length) lines.push(`<b>ISS Err:</b> ${j.issErr}`);
-  document.getElementById('status').innerHTML = lines.join('<br>');
-
+async function nudgeServo(delta){
   const sv = document.getElementById('servo');
-  if (sv && parseInt(sv.value) !== j.servoAngle) {
+  let v = parseInt(sv.value || "0", 10) + delta;
+  if (v < 0) v = 0;
+  if (v > 180) v = 180;
+  sv.value = v;
+  document.getElementById('servoVal').innerText = v;
+  await fetch('/api/servo?angle=' + encodeURIComponent(v));
+}
+
+let obsFilled = false;
+async function saveObserver(){
+  const lat = document.getElementById('obsLat').value;
+  const lon = document.getElementById('obsLon').value;
+  const alt = document.getElementById('obsAlt').value;
+  await fetch(`/api/observer/set?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&alt=${encodeURIComponent(alt)}`);
+  // Refresh status so the UI reflects new values immediately
+  await poll();
+}
+
+
+function renderStatus(j){
+
+  const left = [];
+  const right = [];
+
+  left.push(`<b>WiFi:</b> ${j.wifiMode} ${j.ip} (RSSI ${j.rssi})`);
+  left.push(`<b>Tracking:</b> ${j.tracking} &nbsp; <b>ManualOverride:</b> ${j.manualOverride}`);
+  left.push(`<b>Homed:</b> ${j.homed} &nbsp; <b>HomeState:</b> ${j.homeState}`);
+  left.push(`<b>Hall:</b> raw=${j.hallRaw} active=${j.hallActive}`);
+  left.push(`<b>Az deg (north-ref):</b> ${Number(j.azDeg).toFixed(2)}&deg;`);
+  left.push(`<b>Az steps:</b> ${j.azSteps}`);
+  left.push(`<b>North offset steps:</b> ${j.northOffset}`);
+  left.push(`<b>Servo:</b> ${j.servoAngle}&deg; (pulse ${j.servoPulse}us)`);
+
+  right.push(`<b>Observer:</b> ${Number(j.obsLat).toFixed(4)}, ${Number(j.obsLon).toFixed(4)} alt ${Number(j.obsAltM).toFixed(0)}m`);
+  right.push(`<b>ISS:</b> ${Number(j.issLat).toFixed(3)}, ${Number(j.issLon).toFixed(3)} alt ${Number(j.issAltM).toFixed(0)}m`);
+  right.push(`<b>Target Az/El:</b> ${Number(j.tAz).toFixed(2)}&deg; / ${Number(j.tEl).toFixed(2)}&deg;`);
+  right.push(`<b>Poll:</b> ${j.pollMs}ms &nbsp; <b>FAST:</b> ${j.fastMode}`);
+  right.push(`<b>ISS HTTP:</b> ${j.issHttp} &nbsp; <b>Age:</b> ${Math.round(j.issAgeMs/1000)}s`);
+  right.push(`<b>Uptime:</b> ${Math.round(j.uptimeMs/1000)}s`);
+
+  document.getElementById('statusL').innerHTML = left.join('<br>');
+  document.getElementById('statusR').innerHTML = right.join('<br>');
+
+  // Keep slider in sync when not tracking (manual)
+  const sv = document.getElementById('servo');
+  if (!j.tracking && parseInt(sv.value,10) !== j.servoAngle) {
     sv.value = j.servoAngle;
     document.getElementById('servoVal').innerText = j.servoAngle;
   }
-}
 
-async function poll(){
+  if (!obsFilled) {
+    document.getElementById('obsLat').value = j.obsLat;
+    document.getElementById('obsLon').value = j.obsLon;
+    document.getElementById('obsAlt').value = j.obsAltM;
+    obsFilled = true;
+  }
+}
+(){
   try{
     const r = await fetch('/api/status');
     const j = await r.json();
@@ -782,6 +856,9 @@ void handleStatus() {
   json += "\"hallActive\":" + String(hallActive() ? "true" : "false") + ",";
   json += "\"azSteps\":" + String(steps) + ",";
   json += "\"azDeg\":" + String(azDeg, 4) + ",";
+  json += "\"obsLat\":" + String(obsLatDeg, 6) + ",";
+  json += "\"obsLon\":" + String(obsLonDeg, 6) + ",";
+  json += "\"obsAltM\":" + String(obsAltM, 1) + ",";
   json += "\"northOffset\":" + String((long)northOffsetSteps) + ",";
   json += "\"servoAngle\":" + String((int)servoAngle) + ",";
   json += "\"servoPulse\":" + String((int)servoPulseUs) + ",";
@@ -797,7 +874,49 @@ void handleStatus() {
   json += "\"issAgeMs\":" + String(okMs == 0 ? 999999999UL : (millis() - okMs)) + ",";
   json += "\"uptimeMs\":" + String(millis());
   json += "}";
+  
+void handleObserverGet() {
+  String json = "{";
+  json += "\"lat\":" + String(obsLatDeg, 6) + ",";
+  json += "\"lon\":" + String(obsLonDeg, 6) + ",";
+  json += "\"altM\":" + String(obsAltM, 1);
+  json += "}";
   server.send(200, "application/json", json);
+}
+
+static bool parseDoubleArg(const String& name, double& out) {
+  if (!server.hasArg(name)) return false;
+  out = server.arg(name).toDouble();
+  return true;
+}
+
+void handleObserverSet() {
+  trackingEnabled = false;
+  manualOverride = true;
+
+  double lat, lon, alt;
+  if (!parseDoubleArg("lat", lat) || !parseDoubleArg("lon", lon) || !parseDoubleArg("alt", alt)) {
+    server.send(400, "text/plain", "missing lat/lon/alt");
+    return;
+  }
+
+  if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 || alt < -500.0 || alt > 10000.0) {
+    server.send(400, "text/plain", "invalid range");
+    return;
+  }
+
+  obsLatDeg = lat;
+  obsLonDeg = lon;
+  obsAltM   = alt;
+
+  prefs.putDouble("obsLat", obsLatDeg);
+  prefs.putDouble("obsLon", obsLonDeg);
+  prefs.putDouble("obsAlt", obsAltM);
+
+  sendOk("observer saved");
+}
+
+server.send(200, "application/json", json);
 }
 
 void handleHome() {
@@ -894,6 +1013,11 @@ void setup() {
   northOffsetSteps = prefs.getLong("northOffset", 0);
   servoAngle = prefs.getInt("servoAngle", 90);
 
+  // Load observer location (persisted if changed via UI)
+  obsLatDeg = prefs.getDouble("obsLat", OBS_LAT_DEFAULT_DEG);
+  obsLonDeg = prefs.getDouble("obsLon", OBS_LON_DEFAULT_DEG);
+  obsAltM   = prefs.getDouble("obsAlt", OBS_ALT_DEFAULT_M);
+
   stepper.setMaxSpeed(MOVE_SPEED);
   stepper.setAcceleration(MOVE_ACCEL);
   stepper.setCurrentPosition(0);
@@ -907,6 +1031,8 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/api/status", handleStatus);
+  server.on("/api/observer", handleObserverGet);
+  server.on("/api/observer/set", handleObserverSet);
   server.on("/api/home", handleHome);
   server.on("/api/set_north", handleSetNorth);
   server.on("/api/servo", handleServo);
