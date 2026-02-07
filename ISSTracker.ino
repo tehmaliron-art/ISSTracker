@@ -34,27 +34,6 @@ const bool HALL_ACTIVE_LOW = true;
 
 const int SERVO_PIN = 32;
 
-
-// ---------------------- BOOT HOME (latching hall) ----------------------
-// Hall output is LATCHING and NOT a position indicator at boot.
-// We force REAL transitions (RESET -> INDEX) to establish a true home after a cold boot.
-// Directions are in stepper speed sign: + = one direction, - = the other.
-// If your magnet order is wrong, flip these signs.
-const bool  BOOT_HOME_ENABLE    = true;
-const bool  AUTO_TRACK_ON_BOOT  = true;   // start tracking automatically after successful boot-home
-
-// Choose directions independently (often both the same direction if RESET is encountered before INDEX).
-const int   BOOT_HOME_DIR_RESET = +1;     // seek RESET (inactive)
-const int   BOOT_HOME_DIR_INDEX = +1;     // seek INDEX (active)
-
-const float BOOT_HOME_SPEED     = 350.0f;
-const float BOOT_HOME_ACCEL     = 600.0f;
-
-// Maximum revolutions to spend per phase before giving up (RESET seek, then INDEX seek).
-const float BOOT_HOME_MAX_REVS  = 2.0f;
-const uint32_t BOOT_HOME_FUDGE_MS = 5000;
-
-
 // ---------------------- MECH / TUNING ----------------------
 const long  STEPS_PER_REV = 8192;
 const float STEPS_PER_DEG = (float)STEPS_PER_REV / 360.0f;
@@ -122,8 +101,6 @@ volatile HomeState homeState = ST_IDLE;
 
 unsigned long phaseStartMs = 0;
 unsigned long phaseTimeoutMs = 0;
-
-volatile bool verifySawReset = false; // homing verify progress (reset each homing)
 
 volatile long northOffsetSteps = 0;
 volatile bool isHomed = false;
@@ -248,7 +225,6 @@ void updateHallLandmarkSnap() {
 void startHoming() {
   homeState = ST_SEEK_RESET;
   isHomed = false;
-  verifySawReset = false;
 
   stepper.setMaxSpeed(SEEK_SPEED);
   stepper.setAcceleration(SEEK_ACCEL);
@@ -266,7 +242,7 @@ void startHoming() {
 }
 
 void updateHoming() {
-  if (homeState == ST_IDLE || homeState == ST_FAIL) return;
+  if (homeState == ST_IDLE || homeState == ST_DONE || homeState == ST_FAIL) return;
 
   if (phaseTimedOut()) {
     homeState = ST_FAIL;
@@ -299,11 +275,11 @@ void updateHoming() {
       break;
 
     case ST_VERIFY: {
-      // Latching hall means we must see RESET (inactive) then INDEX (active) again.
-      if (!verifySawReset && !hallActive()) verifySawReset = true;
-      if (verifySawReset && hallActive()) {
-        verifySawReset = false;
-        homeState = ST_IDLE;  // done; return to IDLE so manual controls work immediately
+      static bool sawReset = false;
+      if (!sawReset && !hallActive()) sawReset = true;
+      if (sawReset && hallActive()) {
+        sawReset = false;
+        homeState = ST_DONE;
         stepper.setSpeed(0);
       }
       break;
@@ -312,64 +288,6 @@ void updateHoming() {
     default:
       break;
   }
-}
-
-
-bool bootHomeLatchingHall() {
-  if (!BOOT_HOME_ENABLE) return false;
-
-  trackingEnabled = false;
-  manualOverride  = true;
-  homeState       = ST_IDLE;
-  isHomed         = false;
-  verifySawReset  = false;
-
-  // Phase timeouts based on speed and max revolutions
-  auto phaseTimeoutMsFor = [](float speedStepsPerSec, float revs, uint32_t fudgeMs) -> uint32_t {
-    if (speedStepsPerSec < 1.0f) speedStepsPerSec = 1.0f;
-    if (revs < 0.1f) revs = 0.1f;
-    float seconds = (STEPS_PER_REV * revs) / speedStepsPerSec;
-    return (uint32_t)(seconds * 1000.0f) + fudgeMs;
-  };
-
-  // STEP helper that keeps OTA/UI responsive during boot-home
-  auto runSpeedResponsive = [&]() {
-    stepper.runSpeed();
-    ArduinoOTA.handle();
-    server.handleClient();
-    delay(0);
-  };
-
-  stepper.setMaxSpeed(BOOT_HOME_SPEED);
-  stepper.setAcceleration(BOOT_HOME_ACCEL);
-
-  // 1) Seek RESET (inactive) to force a known transition chain.
-  //    If we're already inactive, this loop exits immediately.
-  uint32_t toMs = phaseTimeoutMsFor(BOOT_HOME_SPEED, BOOT_HOME_MAX_REVS, BOOT_HOME_FUDGE_MS);
-  unsigned long t0 = millis();
-
-  stepper.setSpeed(BOOT_HOME_SPEED * (float)BOOT_HOME_DIR_RESET);
-  while (hallActive()) {
-    runSpeedResponsive();
-    if (millis() - t0 > toMs) return false;
-  }
-
-  // 2) Seek INDEX (active) and latch it as true home = 0.
-  toMs = phaseTimeoutMsFor(BOOT_HOME_SPEED, BOOT_HOME_MAX_REVS, BOOT_HOME_FUDGE_MS);
-  t0 = millis();
-
-  stepper.setSpeed(BOOT_HOME_SPEED * (float)BOOT_HOME_DIR_INDEX);
-  while (!hallActive()) {
-    runSpeedResponsive();
-    if (millis() - t0 > toMs) return false;
-  }
-
-  stepper.setCurrentPosition(0);
-  isHomed = true;
-  lastHallRaw = hallRaw();
-  stepper.setSpeed(0);
-
-  return true;
 }
 
 // ---------------------- ISS MATH (ECEF -> ENU -> Az/El) ----------------------
@@ -875,6 +793,10 @@ void handleStatus() {
   json += "\"uptimeMs\":" + String(millis());
   json += "}";
   
+  server.send(200, "application/json", json);
+}
+
+
 void handleObserverGet() {
   String json = "{";
   json += "\"lat\":" + String(obsLatDeg, 6) + ",";
@@ -916,8 +838,6 @@ void handleObserverSet() {
   sendOk("observer saved");
 }
 
-server.send(200, "application/json", json);
-}
 
 void handleHome() {
   trackingEnabled = false;
@@ -1002,6 +922,11 @@ void handleTrackStop() {
 }
 
 // ---------------------- SETUP / LOOP ----------------------
+
+// Forward declarations
+void handleObserverGet();
+void handleObserverSet();
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -1042,15 +967,6 @@ void setup() {
   server.on("/api/track/stop", handleTrackStop);
 
   server.begin();
-
-  // Boot-home after cold boot (latching hall). Keeps OTA/UI responsive while rotating.
-  if (BOOT_HOME_ENABLE) {
-    bool ok = bootHomeLatchingHall();
-    if (ok && AUTO_TRACK_ON_BOOT) {
-      manualOverride = false;
-      trackingEnabled = true;
-    }
-  }
 
   // Start ISS background task (Core 0 tends to keep WiFi happy; Core 1 runs loop/UI)
   xTaskCreatePinnedToCore(
