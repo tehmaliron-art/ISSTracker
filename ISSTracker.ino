@@ -172,6 +172,27 @@ String ipString() {
   return WiFi.localIP().toString();
 }
 
+
+// Minimal JSON string escaper (enough for /api/status payload)
+static String jsonEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    const char c = in[i];
+    switch (c) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n':  out += "\\n";  break;
+      case '\r':  out += "\\r";  break;
+      case '\t':  out += "\\t";  break;
+      default:
+        if ((uint8_t)c >= 0x20) out += c;
+        break;
+    }
+  }
+  return out;
+}
+
 // Normalize degrees to [0,360)
 double wrap360(double deg) {
   while (deg < 0) deg += 360.0;
@@ -607,27 +628,13 @@ String htmlPage() {
     <div class="sideBtns">
       <button onclick="api('/api/home')">Home</button>
       <button onclick="api('/api/set_north')">Set North</button>
+      <button onclick="api('/api/track/start')">Start Tracking</button>
+      <button onclick="api('/api/track/stop')">Stop Tracking</button>
     </div>
   </div>
 </div>
 
-<div class="card">
-  <div class="row">
-    <button onclick="api('/api/track/start')">Start Tracking</button>
-    <button onclick="api('/api/track/stop')">Stop Tracking</button>
-  </div>
-</div>
 
-<div class="card">
-  <div class="row">
-    <div class="label">Elevation (manual)</div>
-    <input id="servo" type="range" min="0" max="180" value="90" oninput="setServo(this.value)">
-    <div><code id="servoVal">90</code>&deg;</div>
-  </div>
-  <div style="font-size: 0.9em; opacity: 0.8; margin-top: 8px;">
-    Manual slider is overridden while tracking is running.
-  </div>
-</div>
 
 <div class="card">
   <h3>Status</h3>
@@ -637,33 +644,17 @@ String htmlPage() {
   </div>
 </div>
 
-<div class="card">
-  <h3>Observer</h3>
-  <div class="row">
-    <div class="label">Lat</div><input id="obsLat" class="text" inputmode="decimal">
-    <div class="label">Lon</div><input id="obsLon" class="text" inputmode="decimal">
-    <div class="label">Alt (m)</div><input id="obsAlt" class="text" inputmode="decimal">
-    <button onclick="saveObserver()">Save</button>
-  </div>
-  <div style="font-size: 0.9em; opacity: 0.8; margin-top: 8px;">
-    Saving observer location stops tracking and switches to manual mode.
-  </div>
-</div>
+
 
 <script>
 async function api(url){ try { await fetch(url); } catch(e) {} }
-async function setServo(v){
-  document.getElementById('servoVal').innerText = v;
-  await fetch('/api/servo?angle=' + encodeURIComponent(v));
-}
+let curServoAngle = 90;
 
 async function nudgeServo(delta){
-  const sv = document.getElementById('servo');
-  let v = parseInt(sv.value || "0", 10) + delta;
+  let v = parseInt(curServoAngle || "0", 10) + delta;
   if (v < 0) v = 0;
   if (v > 180) v = 180;
-  sv.value = v;
-  document.getElementById('servoVal').innerText = v;
+  curServoAngle = v;
   await fetch('/api/servo?angle=' + encodeURIComponent(v));
 }
 
@@ -701,13 +692,8 @@ function renderStatus(j){
 
   document.getElementById('statusL').innerHTML = left.join('<br>');
   document.getElementById('statusR').innerHTML = right.join('<br>');
+  curServoAngle = j.servoAngle;
 
-  // Keep slider in sync when not tracking (manual)
-  const sv = document.getElementById('servo');
-  if (!j.tracking && parseInt(sv.value,10) !== j.servoAngle) {
-    sv.value = j.servoAngle;
-    document.getElementById('servoVal').innerText = j.servoAngle;
-  }
 
   if (!obsFilled) {
     document.getElementById('obsLat').value = j.obsLat;
@@ -716,17 +702,21 @@ function renderStatus(j){
     obsFilled = true;
   }
 }
-(){
+
+async function poll(){
   try{
     const r = await fetch('/api/status');
     const j = await r.json();
     renderStatus(j);
   }catch(e){
-    document.getElementById('status').innerText = 'Status fetch failed';
+    document.getElementById('statusL').innerText = 'Status fetch failed';
   }
 }
-setInterval(poll, 600);
-poll();
+async function pollLoop(){
+  await poll();
+  setTimeout(pollLoop, 600);
+}
+pollLoop();
 </script>
 </body></html>
 )HTML";
