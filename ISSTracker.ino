@@ -173,6 +173,7 @@ String ipString() {
   return WiFi.localIP().toString();
 }
 
+
 // Minimal JSON string escaper (enough for /api/status payload)
 static String jsonEscape(const String& in) {
   String out;
@@ -182,9 +183,9 @@ static String jsonEscape(const String& in) {
     switch (c) {
       case '"':  out += "\\\""; break;
       case '\\': out += "\\\\"; break;
-      case '\n': out += "\\n";  break;
-      case '\r': out += "\\r";  break;
-      case '\t': out += "\\t";  break;
+      case '\n':  out += "\\n";  break;
+      case '\r':  out += "\\r";  break;
+      case '\t':  out += "\\t";  break;
       default:
         if ((uint8_t)c >= 0x20) out += c;
         break;
@@ -633,27 +634,13 @@ String htmlPage() {
     <div class="sideBtns">
       <button onclick="api('/api/home')">Home</button>
       <button onclick="api('/api/set_north')">Set North</button>
+      <button onclick="api('/api/track/start')">Start Tracking</button>
+      <button onclick="api('/api/track/stop')">Stop Tracking</button>
     </div>
   </div>
 </div>
 
-<div class="card">
-  <div class="row">
-    <button onclick="api('/api/track/start')">Start Tracking</button>
-    <button onclick="api('/api/track/stop')">Stop Tracking</button>
-  </div>
-</div>
 
-<div class="card">
-  <div class="row">
-    <div class="label">Elevation (manual)</div>
-    <input id="servo" type="range" min="0" max="180" value="90" oninput="setServo(this.value)">
-    <div><code id="servoVal">90</code>&deg;</div>
-  </div>
-  <div style="font-size: 0.9em; opacity: 0.8; margin-top: 8px;">
-    Manual slider is overridden while tracking is running.
-  </div>
-</div>
 
 <div class="card">
   <h3>Status</h3>
@@ -663,33 +650,17 @@ String htmlPage() {
   </div>
 </div>
 
-<div class="card">
-  <h3>Observer</h3>
-  <div class="row">
-    <div class="label">Lat</div><input id="obsLat" class="text" inputmode="decimal">
-    <div class="label">Lon</div><input id="obsLon" class="text" inputmode="decimal">
-    <div class="label">Alt (m)</div><input id="obsAlt" class="text" inputmode="decimal">
-    <button onclick="saveObserver()">Save</button>
-  </div>
-  <div style="font-size: 0.9em; opacity: 0.8; margin-top: 8px;">
-    Saving observer location stops tracking and switches to manual mode.
-  </div>
-</div>
+
 
 <script>
 async function api(url){ try { await fetch(url); } catch(e) {} }
-async function setServo(v){
-  document.getElementById('servoVal').innerText = v;
-  await fetch('/api/servo?angle=' + encodeURIComponent(v));
-}
+let curServoAngle = 90;
 
 async function nudgeServo(delta){
-  const sv = document.getElementById('servo');
-  let v = parseInt(sv.value || "0", 10) + delta;
+  let v = parseInt(curServoAngle || "0", 10) + delta;
   if (v < 0) v = 0;
   if (v > 180) v = 180;
-  sv.value = v;
-  document.getElementById('servoVal').innerText = v;
+  curServoAngle = v;
   await fetch('/api/servo?angle=' + encodeURIComponent(v));
 }
 
@@ -710,12 +681,9 @@ function renderStatus(j){
   const right = [];
 
   left.push(`<b>WiFi:</b> ${j.wifiMode} ${j.ip} (RSSI ${j.rssi})`);
-  left.push(`<b>Tracking:</b> ${j.tracking} &nbsp; <b>ManualOverride:</b> ${j.manualOverride}`);
-  if (!j.ready) {
-    left.push(`<b>Ready:</b> false (Home + Set North required)`);
-  } else {
-    left.push(`<b>Ready:</b> true`);
-  }
+  left.push(`<b>Tracking:</b> ${j.tracking}`);
+  left.push(`<b>Ready:</b> ${j.ready} ${(!j.ready ? '(Home + Set North required)' : '')}`);
+  left.push(`<b>ManualOverride:</b> ${j.manualOverride}`);
   left.push(`<b>Homed:</b> ${j.homed} &nbsp; <b>HomeState:</b> ${j.homeState}`);
   left.push(`<b>Hall:</b> raw=${j.hallRaw} active=${j.hallActive}`);
   left.push(`<b>Az deg (north-ref):</b> ${Number(j.azDeg).toFixed(2)}&deg;`);
@@ -732,6 +700,8 @@ function renderStatus(j){
 
   document.getElementById('statusL').innerHTML = left.join('<br>');
   document.getElementById('statusR').innerHTML = right.join('<br>');
+  curServoAngle = j.servoAngle;
+
 
   if (!obsFilled) {
     const elLat = document.getElementById('obsLat');
@@ -745,17 +715,21 @@ function renderStatus(j){
     }
   }
 }
-(){
+
+async function poll(){
   try{
     const r = await fetch('/api/status');
     const j = await r.json();
     renderStatus(j);
   }catch(e){
-    document.getElementById('status').innerText = 'Status fetch failed';
+    document.getElementById('statusL').innerText = 'Status fetch failed';
   }
 }
-setInterval(poll, 600);
-poll();
+async function pollLoop(){
+  await poll();
+  setTimeout(pollLoop, 600);
+}
+pollLoop();
 </script>
 </body></html>
 )HTML";
@@ -882,6 +856,8 @@ void handleSetNorth() {
   manualOverride = true;
   northOffsetSteps = stepper.currentPosition();
   prefs.putLong("northOffset", (long)northOffsetSteps);
+  hasNorthOffset = true;
+  prefs.putBool("hasNorthOffset", true);
   sendOk("north offset saved");
 }
 
@@ -1006,6 +982,7 @@ void setup() {
     manualOverride = false;
     trackingEnabled = true;
   }
+
 
   // Start ISS background task (Core 0 tends to keep WiFi happy; Core 1 runs loop/UI)
   xTaskCreatePinnedToCore(
