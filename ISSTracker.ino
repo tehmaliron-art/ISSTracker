@@ -44,6 +44,10 @@ const bool AZ_INVERT = true;
 // From your logs: reset edge happens ~1992 steps after index (when index=0)
 const long RESET_OFFSET_STEPS = 1992;
 
+// Drift threshold: if we hit a hall landmark and we're off by more than this many steps,
+// stop tracking and re-home.
+const long HALL_DRIFT_THRESHOLD_STEPS = 150;
+
 // homing
 const float SEEK_SPEED   = 350.0f;
 const float SEEK_ACCEL   = 600.0f;
@@ -115,6 +119,11 @@ volatile int lastHallRaw = HIGH;
 // Tracking control
 volatile bool trackingEnabled = false;
 volatile bool manualOverride = false; // set true on any manual action; Start Tracking clears it
+
+// Re-home request (triggered by drift checks)
+volatile bool rehomeRequested = false;
+volatile bool resumeTrackingAfterRehome = false;
+volatile bool autoStartAfterHoming = false;
 
 // Background task shared data
 portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
@@ -224,8 +233,24 @@ long chooseShortestTargetStepsFromAzDeg(double desiredAzDeg) {
   return currentSteps + delta;
 }
 
-// ---------------------- DRIFT CORRECTION USING BOTH MAGNETS ----------------------
+// ---------------------- HALL LANDMARK TRACKING (NO SNAP DURING TRACKING) ----------------------
+static inline long modSteps(long x) {
+  long m = x % STEPS_PER_REV;
+  if (m < 0) m += STEPS_PER_REV;
+  return m;
+}
+
+static inline long wrapSignedSteps(long x) {
+  // wrap to (-STEPS_PER_REV/2 .. +STEPS_PER_REV/2]
+  if (x >  (STEPS_PER_REV / 2)) x -= STEPS_PER_REV;
+  if (x < -(STEPS_PER_REV / 2)) x += STEPS_PER_REV;
+  return x;
+}
+
 void updateHallLandmarkSnap() {
+  // NOTE: despite the name, this function no longer "snaps" the stepper origin.
+  // With a latching hall sensor, snapping during tracking causes reference-frame jumps.
+  // We only use hall transitions to detect drift and trigger a re-home if needed.
   int h = hallRaw();
   if (h == lastHallRaw) return;
 
@@ -233,28 +258,61 @@ void updateHallLandmarkSnap() {
   int to   = h;
   lastHallRaw = h;
 
-  if (from == LOW && to == HIGH) {
-    // RESET EDGE
-    stepper.setCurrentPosition(RESET_OFFSET_STEPS);
-  } else if (from == HIGH && to == LOW) {
-    // INDEX EDGE
-    stepper.setCurrentPosition(0);
-    isHomed = true;
+  // Only consider drift checks while actively tracking (not manual, not homing)
+  if (!trackingEnabled || manualOverride) return;
+  if (!isHomed || !hasNorthOffset) return;
+  if (homeState != ST_IDLE && homeState != ST_DONE && homeState != ST_FAIL) return;
+
+  // Expected landmark positions are defined relative to HOME (red magnet) where raw becomes LOW (active=true).
+  // When raw transitions to LOW -> HOME landmark (expected mod position ~0).
+  // When raw transitions to HIGH -> RESET landmark (expected mod position ~RESET_OFFSET_STEPS).
+  long expected = (to == LOW) ? 0 : RESET_OFFSET_STEPS;
+
+  long pos = stepper.currentPosition();
+  long posMod = modSteps(pos);
+  long expMod = modSteps(expected);
+
+  long err = wrapSignedSteps(posMod - expMod);
+
+  if (labs(err) > HALL_DRIFT_THRESHOLD_STEPS) {
+    // Flag a re-home. The main loop will stop tracking and run the homing routine.
+    rehomeRequested = true;
+    resumeTrackingAfterRehome = true;
   }
 }
 
-// ---------------------- HOMING ----------------------
+
+// ---------------------- HOMING (LATCHING HALL, CCW ONLY) ----------------------
+// Confirmed hardware mapping (per Robert):
+// - Red magnet sets hall raw LOW  -> hallActive()==true  (HOME landmark)
+// - Blue magnet sets hall raw HIGH -> hallActive()==false (RESET landmark), ~90deg from HOME
+//
+// Homing strategy (CCW only, no reverse/backoff):
+// - If we boot in HOME state (hallActive==true), first seek RESET (hallActive==false), then seek HOME again.
+// - If we boot in RESET state (hallActive==false), seek HOME directly.
+// We only call setCurrentPosition(0) when we hit HOME (hallActive==true).
+
 void startHoming() {
+  // Caller decides whether to auto-start tracking after homing via autoStartAfterHoming / resumeTrackingAfterRehome.
   homeState = ST_SEEK_RESET;
   isHomed = false;
   prefs.putBool("isHomed", false);
 
   stepper.setMaxSpeed(SEEK_SPEED);
   stepper.setAcceleration(SEEK_ACCEL);
-  stepper.setSpeed(SEEK_SPEED);
+  stepper.setSpeed(SEEK_SPEED); // CCW (per existing build wiring)
 
   lastHallRaw = hallRaw();
-  setPhaseTimeoutForRevs(SEEK_SPEED, 1.5f, 5000);
+
+  // If we're already in RESET state (hallActive==false), skip directly to seeking HOME.
+  if (!hallActive()) {
+    homeState = ST_SEEK_INDEX;
+    setPhaseTimeoutForRevs(SEEK_SPEED, 1.1f, 5000);
+  } else {
+    // We are in HOME band, so seek RESET first (<=90deg), then HOME.
+    homeState = ST_SEEK_RESET;
+    setPhaseTimeoutForRevs(SEEK_SPEED, 0.5f, 5000);
+  }
 
   trackingEnabled = false;
   manualOverride = true;
@@ -264,60 +322,86 @@ void startHoming() {
   portEXIT_CRITICAL(&dataMux);
 }
 
+void finishHoming(bool success) {
+  stepper.setSpeed(0);
+  stepper.stop();
+
+  if (!success) {
+    homeState = ST_FAIL;
+    isHomed = false;
+    prefs.putBool("isHomed", false);
+    trackingEnabled = false;
+    manualOverride = true;
+  } else {
+    homeState = ST_DONE;
+    isHomed = true;
+    prefs.putBool("isHomed", true);
+
+    // Auto-resume logic:
+    // - If we triggered a re-home while tracking, resume automatically (if north offset exists).
+    // - On boot, autoStartAfterHoming may be set true to auto-start once homed.
+    bool shouldResume = (resumeTrackingAfterRehome || autoStartAfterHoming) && hasNorthOffset;
+
+    if (shouldResume) {
+      manualOverride = false;
+      trackingEnabled = true;
+
+      portENTER_CRITICAL(&dataMux);
+      havePendingTarget = false;
+      haveTarget = false;
+      fastMode = false;
+      taskPollMs = ISS_POLL_SLOW_MS;
+      portEXIT_CRITICAL(&dataMux);
+    } else {
+      trackingEnabled = false;
+      manualOverride = true;
+    }
+  }
+
+  // Clear one-shot flags
+  rehomeRequested = false;
+  resumeTrackingAfterRehome = false;
+  autoStartAfterHoming = false;
+}
+
 void updateHoming() {
   if (homeState == ST_IDLE || homeState == ST_DONE || homeState == ST_FAIL) return;
 
   if (phaseTimedOut()) {
-    homeState = ST_FAIL;
-    isHomed = false;
-    prefs.putBool("isHomed", false);
-    stepper.stop();
+    finishHoming(false);
     return;
   }
 
   stepper.runSpeed();
-  updateHallLandmarkSnap();
+
+  // track hall transitions
+  int h = hallRaw();
+  if (h != lastHallRaw) lastHallRaw = h;
 
   switch (homeState) {
     case ST_SEEK_RESET:
+      // seek blue marker => hallActive()==false (raw HIGH)
       if (!hallActive()) {
         homeState = ST_SEEK_INDEX;
+        setPhaseTimeoutForRevs(SEEK_SPEED, 1.1f, 5000);
       }
       break;
 
     case ST_SEEK_INDEX:
+      // seek red HOME marker => hallActive()==true (raw LOW)
       if (hallActive()) {
+        // define absolute zero at HOME
         stepper.setCurrentPosition(0);
-        isHomed = true;
-
-        stepper.setMaxSpeed(VERIFY_SPEED);
-        stepper.setAcceleration(VERIFY_ACCEL);
-        stepper.setSpeed(VERIFY_SPEED);
-
-        setPhaseTimeoutForRevs(VERIFY_SPEED, 1.1f, 5000);
-        homeState = ST_VERIFY;
+        finishHoming(true);
       }
       break;
-
-    case ST_VERIFY: {
-      static bool sawReset = false;
-      if (!sawReset && !hallActive()) sawReset = true;
-      if (sawReset && hallActive()) {
-        sawReset = false;
-        homeState = ST_DONE;
-        isHomed = true;
-        prefs.putBool("isHomed", true);
-        stepper.setSpeed(0);
-      }
-      break;
-    }
 
     default:
       break;
   }
 }
 
-// ---------------------- ISS MATH (ECEF -> ENU -> Az/El) ----------------------
+// ---------------------- ISS MATH (ECEF -> ENU -> Az/El) ---------------------- (ECEF -> ENU -> Az/El) ----------------------
 static inline double deg2rad(double d) { return d * 0.017453292519943295; }
 static inline double rad2deg(double r) { return r * 57.29577951308232; }
 
@@ -847,6 +931,12 @@ void handleObserverSet() {
 void handleHome() {
   trackingEnabled = false;
   manualOverride = true;
+
+  // Manual Home should NOT auto-start tracking afterwards.
+  rehomeRequested = false;
+  resumeTrackingAfterRehome = false;
+  autoStartAfterHoming = false;
+
   startHoming();
   sendOk("homing started");
 }
@@ -905,8 +995,15 @@ void handleTrackStart() {
     return;
   }
 
-  // optional: require homed before tracking
-  // if (!isHomed) { server.send(409, "text/plain", "not homed"); return; }
+  if (!isHomed) {
+    server.send(409, "text/plain", "not homed - press Home first");
+    return;
+  }
+
+  if (!hasNorthOffset) {
+    server.send(409, "text/plain", "north not set - jog to North and press Set North");
+    return;
+  }
 
   manualOverride = false;
   trackingEnabled = true;
@@ -944,7 +1041,8 @@ void setup() {
   prefs.begin("isst", false);
   northOffsetSteps = prefs.getLong("northOffset", 0);
   hasNorthOffset = prefs.getBool("hasNorthOffset", false);
-  isHomed = prefs.getBool("isHomed", false);
+  isHomed = false; // always re-home on boot (latching hall has no absolute at power-up)
+  prefs.putBool("isHomed", false);
   servoAngle = prefs.getInt("servoAngle", 90);
 
   // Load observer location (persisted if changed via UI)
@@ -977,11 +1075,15 @@ void setup() {
 
   server.begin();
 
-  // Auto-start tracking on boot only if we have the required calibration
-  if (isHomed && hasNorthOffset) {
-    manualOverride = false;
-    trackingEnabled = true;
-  }
+  // Always home on boot. Optionally auto-start tracking after homing if North was previously set.
+  trackingEnabled = false;
+  manualOverride = true;
+
+  rehomeRequested = false;
+  resumeTrackingAfterRehome = false;
+  autoStartAfterHoming = hasNorthOffset;
+
+  startHoming();
 
 
   // Start ISS background task (Core 0 tends to keep WiFi happy; Core 1 runs loop/UI)
@@ -1000,7 +1102,13 @@ void loop() {
   ArduinoOTA.handle();
   server.handleClient();
 
-  updateHallLandmarkSnap();
+  // If we detected drift while tracking, stop and re-home.
+  if (rehomeRequested && (homeState == ST_IDLE || homeState == ST_DONE || homeState == ST_FAIL)) {
+    trackingEnabled = false;
+    manualOverride = true;
+    autoStartAfterHoming = false; // resume logic is handled by resumeTrackingAfterRehome
+    startHoming();
+  }
 
   // Homing mode
   if (homeState != ST_IDLE && homeState != ST_DONE && homeState != ST_FAIL) {
