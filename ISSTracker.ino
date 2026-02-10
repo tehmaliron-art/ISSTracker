@@ -123,6 +123,7 @@ uint32_t nowEpoch() {
 static bool haveNextPass = false;
 static uint32_t nextPassMaxUTC = 0;
 static double nextPassMaxEl = 0.0;
+static int nextPassMaxAz = -1; // degrees, 0-359; -1 unknown
 static unsigned long lastN2yoFetchMs = 0;
 
 
@@ -259,6 +260,18 @@ double wrap360(double deg) {
   while (deg < 0) deg += 360.0;
   while (deg >= 360.0) deg -= 360.0;
   return deg;
+}
+
+// Convert azimuth degrees to a short compass direction (8-way)
+const char* azToCompass8(int azDegInt) {
+  if (azDegInt < 0) return "";
+  azDegInt %= 360;
+  if (azDegInt < 0) azDegInt += 360;
+  static const char* dirs[] = {"N","NE","E","SE","S","SW","W","NW"};
+  int idx = (azDegInt + 22) / 45; // center bins
+  if (idx < 0) idx = 0;
+  if (idx > 7) idx = 7;
+  return dirs[idx];
 }
 
 // Choose shortest rotation to reach desired azimuth (north-referenced degrees)
@@ -583,7 +596,7 @@ bool fetchIssOnce(double &lat, double &lon, double &altM_out, int &httpCode, Str
 }
 
 
-bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &httpCode, String &err) {
+bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &maxAzOut, int &httpCode, String &err) {
   err = "";
   httpCode = 0;
 
@@ -630,11 +643,21 @@ bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &httpCode, Str
 
   double maxUTC = 0;
   double maxEl = 0;
+  double maxAz = 0;
   if (!extractJsonNumber(body, "maxUTC", maxUTC) || maxUTC <= 0) { err = "parse maxUTC"; return false; }
   if (!extractJsonNumber(body, "maxEl",  maxEl))                 { err = "parse maxEl";  return false; }
 
+  // maxAz is optional; if absent, we just won't show a direction hint.
+  int azInt = -1;
+  if (extractJsonNumber(body, "maxAz", maxAz)) {
+    azInt = (int)lround(maxAz);
+    azInt %= 360;
+    if (azInt < 0) azInt += 360;
+  }
+
   maxUTCOut = (uint32_t)maxUTC;
   maxElOut = maxEl;
+  maxAzOut = azInt;
   return true;
 }
 
@@ -662,6 +685,7 @@ void ensureNextPass(bool forceFetch) {
     haveNextPass = true;
     nextPassMaxUTC = maxUTC;
     nextPassMaxEl = maxEl;
+    nextPassMaxAz = maxAz;
     Serial.printf("[PASS] Next overhead maxUTC=%lu (in %ld s), maxEl=%.1f\n",
                   (unsigned long)nextPassMaxUTC,
                   timeSynced ? (long)((int32_t)nextPassMaxUTC - (int32_t)nowEpoch()) : -1L,
@@ -989,6 +1013,11 @@ void updateOLED() {
     oled.print(buf);
     oled.print(" P");
     oled.print((int)lround(nextPassMaxEl));
+    if (nextPassMaxAz >= 0) {
+      oled.print(" A");
+      oled.print(nextPassMaxAz);
+      oled.print(azToCompass8(nextPassMaxAz));
+    }
   } else {
     oled.print("Next TBD");
   }
@@ -1150,6 +1179,16 @@ function renderStatus(j){
   const left = [];
   const right = [];
 
+  function fmtDt(sec){
+    if (sec === undefined || sec === null || sec < 0) return 'TBD';
+    sec = Math.floor(sec);
+    const h = Math.floor(sec/3600);
+    const m = Math.floor((sec%3600)/60);
+    const s = sec%60;
+    if (h > 0) return `${h}h ${m}m`;
+    return `${m}m ${s}s`;
+  }
+
   left.push(`<b>WiFi:</b> ${j.wifiMode} ${j.ip} (RSSI ${j.rssi})`);
   left.push(`<b>Tracking:</b> ${j.tracking}`);
   left.push(`<b>Ready:</b> ${j.ready} ${(!j.ready ? '(Home + Set North required)' : '')}`);
@@ -1165,6 +1204,19 @@ function renderStatus(j){
   right.push(`<b>Observer:</b> ${Number(j.obsLat).toFixed(4)}, ${Number(j.obsLon).toFixed(4)} alt ${Number(j.obsAltM).toFixed(0)}m`);
   right.push(`<b>ISS:</b> ${Number(j.issLat).toFixed(3)}, ${Number(j.issLon).toFixed(3)} alt ${Number(j.issAltM).toFixed(0)}m`);
   right.push(`<b>Target Az/El:</b> ${Number(j.tAz).toFixed(2)}&deg; / ${Number(j.tEl).toFixed(2)}&deg;`);
+
+  if (j.haveNextPass && j.timeSynced) {
+    let line = `<b>Next pass (max):</b> in ${fmtDt(j.nextPassDt)} (P${Math.round(j.nextPassMaxEl)}&deg;`;
+    if (j.nextPassMaxAz >= 0) {
+      const comp = (j.nextPassAzComp || '').trim();
+      line += `, Az ${Math.round(j.nextPassMaxAz)}&deg; ${comp}`;
+    }
+    line += `)`;
+    right.push(line);
+  } else {
+    right.push(`<b>Next pass (max):</b> TBD`);
+  }
+
   right.push(`<b>Poll:</b> ${j.pollMs}ms &nbsp; <b>FAST:</b> ${j.fastMode}`);
   right.push(`<b>ISS HTTP:</b> ${j.issHttp} &nbsp; <b>Age:</b> ${Math.round(j.issAgeMs/1000)}s`);
   right.push(`<b>Uptime:</b> ${Math.round(j.uptimeMs/1000)}s`);
@@ -1224,6 +1276,13 @@ void handleStatus() {
   bool fm;
   uint32_t pm;
 
+  bool ts;
+  uint32_t nowE;
+  bool hnp;
+  uint32_t pMaxUTC;
+  double pMaxEl;
+  int pMaxAz;
+
   portENTER_CRITICAL(&dataMux);
   lat = issLatDeg; lon = issLonDeg; altM = issAltM;
   tAz = targetAzDeg; tEl = targetElDeg;
@@ -1233,6 +1292,12 @@ void handleStatus() {
   err = lastIssErr;
   fm = fastMode;
   pm = taskPollMs;
+  ts = timeSynced;
+  nowE = ts ? nowEpoch() : 0;
+  hnp = haveNextPass;
+  pMaxUTC = nextPassMaxUTC;
+  pMaxEl = nextPassMaxEl;
+  pMaxAz = nextPassMaxAz;
   portEXIT_CRITICAL(&dataMux);
 
   String json = "{";
@@ -1267,6 +1332,16 @@ void handleStatus() {
   json += "\"issHttp\":" + String(httpc) + ",";
   json += "\"issErr\":\"" + err + "\",";
   json += "\"issAgeMs\":" + String(okMs == 0 ? 999999999UL : (millis() - okMs)) + ",";
+  json += "\"timeSynced\":" + String(ts ? "true" : "false") + ",";
+  json += "\"nowEpoch\":" + String(nowE) + ",";
+  json += "\"haveNextPass\":" + String(hnp ? "true" : "false") + ",";
+  json += "\"nextPassMaxUTC\":" + String(pMaxUTC) + ",";
+  json += "\"nextPassMaxEl\":" + String(pMaxEl, 1) + ",";
+  json += "\"nextPassMaxAz\":" + String(pMaxAz) + ",";
+  int32_t pdt = (hnp && ts) ? ((int32_t)pMaxUTC - (int32_t)nowE) : -1;
+  if (pdt < 0) pdt = -1;
+  json += "\"nextPassDt\":" + String(pdt) + ",";
+  json += "\"nextPassAzComp\":\"" + String(azToCompass8(pMaxAz)) + "\","; 
   json += "\"uptimeMs\":" + String(millis());
   json += "}";
   
