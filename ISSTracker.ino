@@ -76,7 +76,8 @@ const int SERVO_MAX_US = 2400;
 // ---------------------- OLED (SSD1306 128x64 I2C) ----------------------
 static const int OLED_W = 128;
 static const int OLED_H = 64;
-static const uint8_t OLED_ADDR = 0x3C;   // common; some modules use 0x3D
+static const uint8_t OLED_ADDR_PRIMARY  = 0x3C;   // 7-bit addr; silkscreen may show 0x78 (8-bit write addr)
+static const uint8_t OLED_ADDR_FALLBACK = 0x3D;   // alternate 7-bit addr
 static const int OLED_RESET_PIN = -1;    // not used with I2C modules
 
 Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, OLED_RESET_PIN);
@@ -85,6 +86,7 @@ unsigned long lastOledMs = 0;
 
 void setupOLED();
 void updateOLED();
+int i2cScanAndReport(bool &found3C, bool &found3D);
 // ---------------------- OBSERVER LOCATION ----------------------
 // Defaults (Bakersfield-ish). These are persisted in NVS once changed via UI.
 static const double OBS_LAT_DEFAULT_DEG = 35.3733;
@@ -698,12 +700,72 @@ void setupOTA() {
 }
 
 // ---------------------- OLED (SSD1306 128x64 I2C) ----------------------
+
+int i2cScanAndReport(bool &found3C, bool &found3D) {
+  found3C = false;
+  found3D = false;
+
+  Serial.println();
+  Serial.println("[I2C] Scanning bus...");
+
+  int found = 0;
+  for (uint8_t addr = 1; addr < 0x7F; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+
+    if (err == 0) {
+      Serial.printf("[I2C] Device found at 0x%02X\n", addr);
+      found++;
+      if (addr == 0x3C) found3C = true;
+      if (addr == 0x3D) found3D = true;
+    } else if (err == 4) {
+      Serial.printf("[I2C] Unknown error at 0x%02X\n", addr);
+    }
+  }
+
+  if (found == 0) {
+    Serial.println("[I2C] No devices found. Check wiring (SDA=21, SCL=22), power, and pull-ups.");
+  } else {
+    Serial.printf("[I2C] Scan complete: %d device(s)\n", found);
+  }
+
+  return found;
+}
+
 void setupOLED() {
   // Default ESP32 I2C pins: SDA=21, SCL=22
   Wire.begin(21, 22);
 
-  oledOk = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
-  if (!oledOk) return;
+  bool found3C = false, found3D = false;
+  (void)i2cScanAndReport(found3C, found3D);
+
+  // Try the common 7-bit SSD1306 addresses. Many modules silkscreen the 8-bit write address (0x78),
+  // which corresponds to 7-bit 0x3C.
+  const uint8_t addrsToTry[] = { OLED_ADDR_PRIMARY, OLED_ADDR_FALLBACK };
+  oledOk = false;
+
+  for (uint8_t i = 0; i < sizeof(addrsToTry); i++) {
+    uint8_t addr = addrsToTry[i];
+    Serial.printf("[OLED] Trying SSD1306 init at 0x%02X...
+", addr);
+    if (oled.begin(SSD1306_SWITCHCAPVCC, addr)) {
+      oledOk = true;
+      Serial.println("[OLED] SSD1306 init OK.");
+      break;
+    }
+    Serial.println("[OLED] SSD1306 init FAILED.");
+  }
+
+  if (!oledOk) {
+    Serial.println("[OLED] OLED init failed.");
+    if (found3C || found3D) {
+      Serial.println("[OLED] I2C device responded at an OLED address, but SSD1306 init failed.");
+      Serial.println("[OLED] This often indicates an SH1106-based 1.3"/0.96" module. Consider switching to Adafruit_SH110X.");
+    } else {
+      Serial.println("[OLED] No I2C device responded at 0x3C/0x3D. Re-check wiring, power, and I2C pull-ups.");
+    }
+    return;
+  }
 
   oled.clearDisplay();
   oled.setTextSize(1);
