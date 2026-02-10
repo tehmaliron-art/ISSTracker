@@ -731,7 +731,14 @@ String htmlPage() {
   .sideBtns button { min-width: 160px; margin: 0; }
 
   .statusGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
   .text { width: 140px; padding: 10px 10px; border-radius: 12px; border: 1px solid var(--btnBorder); background: var(--input); color: var(--text); }
+  .text.obs { width: 112px; padding: 8px 10px; margin: 0; }
+  .obsLbl { color: var(--muted); font-weight: 650; font-size: 13px; margin-right: 4px; }
+  .observerInline { width: 100%; margin-top: 8px; }
+  .observerRow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: center; }
+  button.small { padding: 10px 12px; margin: 0; border-radius: 12px; }
+
 
   .hint { color: var(--muted); font-size: 13px; margin-top: 8px; }
 
@@ -765,8 +772,20 @@ String htmlPage() {
       <button class="primary" onclick="api('/api/track/start')">Start Tracking</button>
       <button class="danger" onclick="api('/api/track/stop')">Stop Tracking</button>
     </div>
+
+  </div>
+
+  <div class="observerInline">
+    <div class="observerRow">
+      <span class="obsLbl">Lat</span><input class="text obs" id="obsLat" placeholder="35.3733">
+      <span class="obsLbl">Lon</span><input class="text obs" id="obsLon" placeholder="-119.0187">
+      <span class="obsLbl">Alt</span><input class="text obs" id="obsAlt" placeholder="120">
+      <button class="small" onclick="saveObserver()">Save</button>
+    </div>
+    <div class="hint">Saving observer location stops tracking and switches to manual mode.</div>
   </div>
 </div>
+
 
 
 
@@ -780,16 +799,6 @@ String htmlPage() {
 
 
 
-<div class="card">
-  <h3>Observer</h3>
-  <div class="row">
-    <span class="label">Lat</span><input class="text" id="obsLat" placeholder="35.3733">
-    <span class="label">Lon</span><input class="text" id="obsLon" placeholder="-119.0187">
-    <span class="label">Alt (m)</span><input class="text" id="obsAlt" placeholder="120">
-    <button onclick="saveObserver()">Save Location</button>
-  </div>
-  <div class="hint">Saving observer location stops tracking and switches to manual mode.</div>
-</div>
 
 <script>
 async function api(url){ try { await fetch(url); } catch(e) {} }
