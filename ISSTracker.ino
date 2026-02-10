@@ -700,7 +700,7 @@ void setupOTA() {
 // ---------------------- OLED (SSD1306 128x64 I2C) ----------------------
 void setupOLED() {
   // Default ESP32 I2C pins: SDA=21, SCL=22
-  Wire.begin();
+  Wire.begin(21, 22);
 
   oledOk = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   if (!oledOk) return;
