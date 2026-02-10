@@ -744,10 +744,9 @@ void setupOLED() {
   const uint8_t addrsToTry[] = { OLED_ADDR_PRIMARY, OLED_ADDR_FALLBACK };
   oledOk = false;
 
-  for (uint8_t i = 0; i < sizeof(addrsToTry); i++) {
+  for (uint8_t i = 0; i < (sizeof(addrsToTry) / sizeof(addrsToTry[0])); i++) {
     uint8_t addr = addrsToTry[i];
-    Serial.printf("[OLED] Trying SSD1306 init at 0x%02X...
-", addr);
+    Serial.printf("[OLED] Trying SSD1306 init at 0x%02X...\n", addr);
     if (oled.begin(SSD1306_SWITCHCAPVCC, addr)) {
       oledOk = true;
       Serial.println("[OLED] SSD1306 init OK.");
@@ -760,7 +759,7 @@ void setupOLED() {
     Serial.println("[OLED] OLED init failed.");
     if (found3C || found3D) {
       Serial.println("[OLED] I2C device responded at an OLED address, but SSD1306 init failed.");
-      Serial.println("[OLED] This often indicates an SH1106-based 1.3"/0.96" module. Consider switching to Adafruit_SH110X.");
+      Serial.println("[OLED] Device seen at 0x3C/0x3D but SSD1306 init failed; may be SH1106 (try Adafruit_SH110X).");
     } else {
       Serial.println("[OLED] No I2C device responded at 0x3C/0x3D. Re-check wiring, power, and I2C pull-ups.");
     }
