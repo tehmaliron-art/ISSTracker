@@ -675,10 +675,11 @@ void ensureNextPass(bool forceFetch) {
 
   uint32_t maxUTC = 0;
   double maxEl = 0;
+  int maxAz = -1;
   int code = 0;
   String err;
 
-  bool ok = fetchNextPassN2YO(maxUTC, maxEl, code, err);
+  bool ok = fetchNextPassN2YO(maxUTC, maxEl, maxAz, code, err);
   lastN2yoFetchMs = millis();
 
   if (ok) {
