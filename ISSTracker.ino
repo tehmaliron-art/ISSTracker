@@ -101,8 +101,30 @@ double obsAltM    = OBS_ALT_DEFAULT_M;
 // ---------------------- ISS API ----------------------
 static const char* ISS_URL = "https://api.wheretheiss.at/v1/satellites/25544";
 
+// N2YO "visual passes" API (ISS NORAD id 25544). Used for next overhead pass estimates.
+static const char* N2YO_BASE = "https://api.n2yo.com/rest/v1/satellite";
+static const char* N2YO_API_KEY = "B2A452-X29HFK-647XCY-5NME";
+
 // ---------------------- NETWORK TIMEOUTS ----------------------
 const uint32_t ISS_HTTP_TIMEOUT_MS = 500;  // your preference
+const uint32_t N2YO_HTTP_TIMEOUT_MS = 2500; // only fetched on boot / after pass
+
+// ---------------------- UNIX TIME (from ISS timestamp + millis) ----------------------
+static bool timeSynced = false;
+static uint32_t timeBaseEpoch = 0;
+static uint32_t timeBaseMillis = 0;
+
+uint32_t nowEpoch() {
+  if (!timeSynced) return 0;
+  return timeBaseEpoch + (uint32_t)((millis() - timeBaseMillis) / 1000);
+}
+
+// ---------------------- NEXT PASS (N2YO) ----------------------
+static bool haveNextPass = false;
+static uint32_t nextPassMaxUTC = 0;
+static double nextPassMaxEl = 0.0;
+static unsigned long lastN2yoFetchMs = 0;
+
 
 // Dynamic polling based on elevation (hysteresis)
 const uint32_t ISS_POLL_SLOW_MS = 2000;
@@ -548,9 +570,107 @@ bool fetchIssOnce(double &lat, double &lon, double &altM_out, int &httpCode, Str
   if (!extractJsonNumber(body, "longitude", lon)) { err = "parse longitude"; return false; }
   if (!extractJsonNumber(body, "altitude", aKm))  { err = "parse altitude"; return false; }
 
+  // Use ISS API timestamp as a lightweight Unix time source.
+  double ts = 0;
+  if (extractJsonNumber(body, "timestamp", ts) && ts > 0) {
+    timeBaseEpoch = (uint32_t)ts;
+    timeBaseMillis = millis();
+    timeSynced = true;
+  }
+
   altM_out = aKm * 1000.0;
   return true;
 }
+
+
+bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &httpCode, String &err) {
+  err = "";
+  httpCode = 0;
+
+  if (WiFi.getMode() != WIFI_STA || WiFi.status() != WL_CONNECTED) {
+    err = "WiFi not connected";
+    return false;
+  }
+
+  // Build URL:
+  // https://api.n2yo.com/rest/v1/satellite/visualpasses/25544/{lat}/{lon}/{alt_m}/{days}/{min_visibility}/&apiKey={key}
+  String url = String(N2YO_BASE) + "/visualpasses/25544/" +
+               String(obsLatDeg, 6) + "/" + String(obsLonDeg, 6) + "/" +
+               String((int)lround(obsAltM)) + "/2/0/&apiKey=" + N2YO_API_KEY;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(N2YO_HTTP_TIMEOUT_MS);
+
+  HTTPClient http;
+  http.setTimeout(N2YO_HTTP_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  if (!http.begin(client, url)) {
+    err = "http.begin() failed";
+    return false;
+  }
+
+  int code = http.GET();
+  httpCode = code;
+
+  if (code <= 0) {
+    err = String("GET failed: ") + http.errorToString(code);
+    http.end();
+    return false;
+  }
+  if (code != 200) {
+    err = String("HTTP ") + code;
+    http.end();
+    return false;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  double maxUTC = 0;
+  double maxEl = 0;
+  if (!extractJsonNumber(body, "maxUTC", maxUTC) || maxUTC <= 0) { err = "parse maxUTC"; return false; }
+  if (!extractJsonNumber(body, "maxEl",  maxEl))                 { err = "parse maxEl";  return false; }
+
+  maxUTCOut = (uint32_t)maxUTC;
+  maxElOut = maxEl;
+  return true;
+}
+
+void ensureNextPass(bool forceFetch) {
+  // Avoid hammering the API if WiFi just came up or time is not synced yet.
+  if (WiFi.getMode() != WIFI_STA || WiFi.status() != WL_CONNECTED) return;
+
+  if (!forceFetch && haveNextPass && timeSynced) {
+    int32_t dt = (int32_t)nextPassMaxUTC - (int32_t)nowEpoch();
+    if (dt > 0) return; // still in the future
+  }
+
+  // Throttle retries in case of temporary failures.
+  if (millis() - lastN2yoFetchMs < 60000) return;
+
+  uint32_t maxUTC = 0;
+  double maxEl = 0;
+  int code = 0;
+  String err;
+
+  bool ok = fetchNextPassN2YO(maxUTC, maxEl, code, err);
+  lastN2yoFetchMs = millis();
+
+  if (ok) {
+    haveNextPass = true;
+    nextPassMaxUTC = maxUTC;
+    nextPassMaxEl = maxEl;
+    Serial.printf("[PASS] Next overhead maxUTC=%lu (in %ld s), maxEl=%.1f\n",
+                  (unsigned long)nextPassMaxUTC,
+                  timeSynced ? (long)((int32_t)nextPassMaxUTC - (int32_t)nowEpoch()) : -1L,
+                  nextPassMaxEl);
+  } else {
+    Serial.printf("[PASS] N2YO fetch failed (HTTP %d): %s\n", code, err.c_str());
+  }
+}
+
 
 // ---------------------- ISS BACKGROUND TASK ----------------------
 void issTask(void* pv) {
@@ -852,7 +972,26 @@ void updateOLED() {
 
   // Line 6: pass stub (we'll fill later)
   oled.setCursor(0, 50);
-  oled.print("Next: TBD");
+  // Line 6: next overhead (from N2YO) countdown to maxUTC
+  if (haveNextPass && timeSynced) {
+    int32_t dt = (int32_t)nextPassMaxUTC - (int32_t)nowEpoch();
+    if (dt < 0) dt = 0;
+    char buf[16];
+    if (dt >= 3600) {
+      int h = dt / 3600;
+      int m = (dt % 3600) / 60;
+      snprintf(buf, sizeof(buf), "Next %dh%02dm", h, m);
+    } else {
+      int m = dt / 60;
+      int s = dt % 60;
+      snprintf(buf, sizeof(buf), "Next %dm%02ds", m, s);
+    }
+    oled.print(buf);
+    oled.print(" P");
+    oled.print((int)lround(nextPassMaxEl));
+  } else {
+    oled.print("Next TBD");
+  }
 
   oled.display();
 }
@@ -1318,6 +1457,15 @@ void setup() {
   elevServo.write((int)servoAngle);
 
   startWiFi();
+  // On boot, grab a timestamp (for countdown) and the next overhead pass estimate.
+  if (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED) {
+    double lat=0, lon=0, altM=0;
+    int code=0;
+    String err;
+    fetchIssOnce(lat, lon, altM, code, err); // sets timeSynced via "timestamp" when available
+    ensureNextPass(true);
+  }
+
   setupOTA();
   setupOLED();
 
@@ -1363,6 +1511,17 @@ void loop() {
   ArduinoOTA.handle();
   server.handleClient();
   updateOLED();
+
+  // Refresh next-pass prediction only after the current one has happened.
+  static unsigned long lastPassCheckMs = 0;
+  if (millis() - lastPassCheckMs > 5000) {
+    lastPassCheckMs = millis();
+    if (!haveNextPass) {
+      ensureNextPass(true);
+    } else if (timeSynced && (int32_t)(nowEpoch() - nextPassMaxUTC) >= 0) {
+      ensureNextPass(true);
+    }
+  }
 
   // If we detected drift while tracking, stop and re-home.
   if (rehomeRequested && (homeState == ST_IDLE || homeState == ST_DONE || homeState == ST_FAIL)) {
