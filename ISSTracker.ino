@@ -111,6 +111,7 @@ volatile bool isHomed = false;
 volatile bool hasNorthOffset = false;
 
 volatile int servoAngle = 90;       // UI-friendly
+int servoZeroDeg = 90;              // servo angle that corresponds to 0° elevation (level)
 volatile int servoPulseUs = 1500;   // actual commanded
 
 // Hall transition tracking
@@ -167,9 +168,18 @@ void setServoAngleClamped(int angle) {
   if (angle < 0) angle = 0;
   if (angle > 180) angle = 180;
   servoAngle = angle;
-  elevServo.write(servoAngle);
+
+  // Keep manual servo control consistent with tracking (use configured pulse range)
+  double elNorm = ((double)servoAngle) / 180.0;
+  if (elNorm < 0.0) elNorm = 0.0;
+  if (elNorm > 1.0) elNorm = 1.0;
+  int pulseUs = SERVO_MIN_US + (int)((SERVO_MAX_US - SERVO_MIN_US) * elNorm);
+  servoPulseUs = pulseUs;
+  elevServo.writeMicroseconds(pulseUs);
+
   prefs.putInt("servoAngle", servoAngle);
 }
+
 
 String wifiModeString() {
   if (WiFi.getMode() == WIFI_AP) return "AP";
@@ -620,7 +630,10 @@ void updateTrackingMotion() {
     stepper.moveTo(targetSteps);
 
     // Elevation mapping: astro elevation (-90..+90) -> servo (0..180)
-    double elServoDeg = el + 90.0;
+    // Calibrated so that servoZeroDeg corresponds to 0° elevation (level)
+    double elServoDeg = (double)servoZeroDeg + el;
+    if (elServoDeg < 0.0) elServoDeg = 0.0;
+    if (elServoDeg > 180.0) elServoDeg = 180.0;
     double elNorm = elServoDeg / 180.0;
     if (elNorm < 0.0) elNorm = 0.0;
     if (elNorm > 1.0) elNorm = 1.0;
@@ -679,28 +692,58 @@ String htmlPage() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ISS Tracker Bench UI</title>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 16px; }
-  .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
-  button { padding: 12px 14px; margin: 6px 6px 6px 0; border-radius: 10px; border: 1px solid #aaa; background: #f6f6f6; }
+  :root {
+    --bg: #0b0f14;
+    --card: #121a24;
+    --border: #2a3442;
+    --text: #e6eaf0;
+    --muted: #aab4c0;
+    --btn: #1b2736;
+    --btnBorder: #2b3a4c;
+    --btnHover: #233246;
+    --accent: #6d5efc;
+    --danger: #d0636c;
+    --input: #0f1620;
+  }
+
+  body { font-family: system-ui, sans-serif; margin: 16px; background: var(--bg); color: var(--text); }
+  h2 { text-align: center; margin: 10px 0 16px; letter-spacing: 0.2px; }
+  .wrap { max-width: 980px; margin: 0 auto; }
+
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 14px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.25); }
+  button { padding: 12px 14px; margin: 6px; border-radius: 12px; border: 1px solid var(--btnBorder); background: var(--btn); color: var(--text); cursor: pointer; }
+  button:hover { background: var(--btnHover); }
   button:active { transform: translateY(1px); }
+  button.primary { border-color: rgba(109,94,252,0.75); }
+  button.danger { border-color: rgba(208,99,108,0.75); }
+
   .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-  .label { min-width: 140px; font-weight: 600; }
-  input[type=range] { width: 260px; }
-  code { background: #f3f3f3; padding: 2px 6px; border-radius: 6px; }
+  .label { min-width: 140px; font-weight: 600; color: var(--muted); }
+  code { background: rgba(255,255,255,0.06); padding: 2px 6px; border-radius: 6px; }
 
-  .controlsTop { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
-  .dpad { display: flex; flex-direction: column; align-items: center; gap: 6px; }
-  .dpadMid { display: flex; align-items: center; gap: 6px; }
-  .dpadBtn { width: 56px; height: 46px; font-size: 20px; padding: 0; }
-  .dpadCenter { width: 56px; height: 46px; }
-  .sideBtns { display: flex; flex-direction: column; gap: 8px; }
+  .controlsTop { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  .dpad { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .dpadMid { display: flex; align-items: center; gap: 8px; }
+  .dpadBtn { width: 58px; height: 48px; font-size: 20px; padding: 0; }
+  .dpadCenter { width: 58px; height: 48px; }
+
+  .sideBtns { display: flex; flex-direction: column; gap: 10px; align-items: stretch; }
+  .sideBtns button { min-width: 160px; margin: 0; }
+
   .statusGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  .text { width: 120px; padding: 10px 10px; border-radius: 10px; border: 1px solid #aaa; background: #fff; }
-  @media (max-width: 720px) { .statusGrid { grid-template-columns: 1fr; } .sideBtns { flex-direction: row; } }
+  .text { width: 140px; padding: 10px 10px; border-radius: 12px; border: 1px solid var(--btnBorder); background: var(--input); color: var(--text); }
 
+  .hint { color: var(--muted); font-size: 13px; margin-top: 8px; }
+
+  @media (max-width: 720px) {
+    .statusGrid { grid-template-columns: 1fr; }
+    .sideBtns { flex-direction: row; flex-wrap: wrap; justify-content: center; }
+    .sideBtns button { min-width: 140px; }
+  }
 </style>
 </head>
 <body>
+<div class="wrap">
 <h2>ISS Tracker Bench UI</h2>
 
 <div class="card">
@@ -718,8 +761,9 @@ String htmlPage() {
     <div class="sideBtns">
       <button onclick="api('/api/home')">Home</button>
       <button onclick="api('/api/set_north')">Set North</button>
-      <button onclick="api('/api/track/start')">Start Tracking</button>
-      <button onclick="api('/api/track/stop')">Stop Tracking</button>
+      <button onclick="setLevel()">Set Level (0°)</button>
+      <button class="primary" onclick="api('/api/track/start')">Start Tracking</button>
+      <button class="danger" onclick="api('/api/track/stop')">Stop Tracking</button>
     </div>
   </div>
 </div>
@@ -735,6 +779,17 @@ String htmlPage() {
 </div>
 
 
+
+<div class="card">
+  <h3>Observer</h3>
+  <div class="row">
+    <span class="label">Lat</span><input class="text" id="obsLat" placeholder="35.3733">
+    <span class="label">Lon</span><input class="text" id="obsLon" placeholder="-119.0187">
+    <span class="label">Alt (m)</span><input class="text" id="obsAlt" placeholder="120">
+    <button onclick="saveObserver()">Save Location</button>
+  </div>
+  <div class="hint">Saving observer location stops tracking and switches to manual mode.</div>
+</div>
 
 <script>
 async function api(url){ try { await fetch(url); } catch(e) {} }
@@ -758,6 +813,11 @@ async function saveObserver(){
   await poll();
 }
 
+async function setLevel(){
+  // Save current servo position as 0° elevation reference
+  await fetch('/api/servo/zero');
+  await poll();
+}
 
 function renderStatus(j){
 
@@ -774,6 +834,7 @@ function renderStatus(j){
   left.push(`<b>Az steps:</b> ${j.azSteps}`);
   left.push(`<b>North offset steps:</b> ${j.northOffset}`);
   left.push(`<b>Servo:</b> ${j.servoAngle}&deg; (pulse ${j.servoPulse}us)`);
+  left.push(`<b>Level ref:</b> ${j.servoZeroDeg}&deg;`);
 
   right.push(`<b>Observer:</b> ${Number(j.obsLat).toFixed(4)}, ${Number(j.obsLon).toFixed(4)} alt ${Number(j.obsAltM).toFixed(0)}m`);
   right.push(`<b>ISS:</b> ${Number(j.issLat).toFixed(3)}, ${Number(j.issLon).toFixed(3)} alt ${Number(j.issAltM).toFixed(0)}m`);
@@ -868,6 +929,7 @@ void handleStatus() {
   json += "\"obsAltM\":" + String(obsAltM, 1) + ",";
   json += "\"northOffset\":" + String((long)northOffsetSteps) + ",";
   json += "\"servoAngle\":" + String((int)servoAngle) + ",";
+  json += "\"servoZeroDeg\":" + String((int)servoZeroDeg) + ",";
   json += "\"servoPulse\":" + String((int)servoPulseUs) + ",";
   json += "\"issLat\":" + String(lat, 6) + ",";
   json += "\"issLon\":" + String(lon, 6) + ",";
@@ -959,6 +1021,14 @@ void handleServo() {
   setServoAngleClamped(a);
   sendOk();
 }
+void handleServoZero() {
+  trackingEnabled = false;
+  manualOverride = true;
+  servoZeroDeg = servoAngle;
+  prefs.putInt("servoZeroDeg", servoZeroDeg);
+  sendOk("level saved");
+}
+
 
 void handleJog() {
   trackingEnabled = false;
@@ -1044,6 +1114,8 @@ void setup() {
   isHomed = false; // always re-home on boot (latching hall has no absolute at power-up)
   prefs.putBool("isHomed", false);
   servoAngle = prefs.getInt("servoAngle", 90);
+  servoZeroDeg = prefs.getInt("servoZeroDeg", 90); // default level at 90°
+
 
   // Load observer location (persisted if changed via UI)
   obsLatDeg = prefs.getDouble("obsLat", OBS_LAT_DEFAULT_DEG);
@@ -1068,6 +1140,7 @@ void setup() {
   server.on("/api/home", handleHome);
   server.on("/api/set_north", handleSetNorth);
   server.on("/api/servo", handleServo);
+  server.on("/api/servo/zero", handleServoZero);
   server.on("/api/jog", handleJog);
   server.on("/api/stop", handleStop);
   server.on("/api/track/start", handleTrackStart);
