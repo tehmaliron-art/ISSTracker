@@ -697,6 +697,106 @@ void setupOTA() {
   ArduinoOTA.begin();
 }
 
+// ---------------------- OLED (SSD1306 128x64 I2C) ----------------------
+void setupOLED() {
+  // Default ESP32 I2C pins: SDA=21, SCL=22
+  Wire.begin();
+
+  oledOk = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  if (!oledOk) return;
+
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(0, 0);
+  oled.println("ISS Tracker");
+  oled.println("OLED online");
+  oled.display();
+  lastOledMs = 0;
+}
+
+static const char* uiStateLabel() {
+  if (homeState != ST_IDLE && homeState != ST_DONE && homeState != ST_FAIL) return "HOMING";
+  if (trackingEnabled && !manualOverride) return "TRACK";
+  if (manualOverride) return "MANUAL";
+  return "IDLE";
+}
+
+void updateOLED() {
+  if (!oledOk) return;
+
+  unsigned long now = millis();
+  if (now - lastOledMs < 500) return;
+  lastOledMs = now;
+
+  // Snapshot shared data
+  double issLat = 0, issLon = 0, tAz = 0, tEl = 0;
+  unsigned long ageMs = 0;
+  int httpCode = 0;
+  portENTER_CRITICAL(&dataMux);
+  issLat = issLatDeg;
+  issLon = issLonDeg;
+  tAz = targetAzDeg;
+  tEl = targetElDeg;
+  httpCode = lastIssHttpCode;
+  ageMs = (lastIssOkMs == 0) ? 0 : (millis() - lastIssOkMs);
+  portEXIT_CRITICAL(&dataMux);
+
+  String ipStr = (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED)
+                   ? WiFi.localIP().toString()
+                   : WiFi.softAPIP().toString();
+
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+
+  // Line 1: IP
+  oled.setCursor(0, 0);
+  oled.print("IP ");
+  oled.print(ipStr);
+
+  // Line 2: RSSI + state
+  oled.setCursor(0, 10);
+  oled.print("RSSI ");
+  oled.print(WiFi.RSSI());
+  oled.print("  ");
+  oled.print(uiStateLabel());
+
+  // Line 3: readiness / hints
+  oled.setCursor(0, 20);
+  if (!isHomed) {
+    oled.print("Need: HOME");
+  } else if (!hasNorthOffset) {
+    oled.print("Need: SET NORTH");
+  } else {
+    oled.print("Az ");
+    oled.print(tAz, 0);
+    oled.print(" El ");
+    oled.print(tEl, 0);
+  }
+
+  // Line 4: ISS lat/lon (rounded)
+  oled.setCursor(0, 30);
+  oled.print("ISS ");
+  oled.print(issLat, 1);
+  oled.print(",");
+  oled.print(issLon, 1);
+
+  // Line 5: data age / HTTP
+  oled.setCursor(0, 40);
+  oled.print("Age ");
+  oled.print((unsigned long)(ageMs / 1000));
+  oled.print("s  H ");
+  oled.print(httpCode);
+
+  // Line 6: pass stub (we'll fill later)
+  oled.setCursor(0, 50);
+  oled.print("Next: TBD");
+
+  oled.display();
+}
+
+
 // ---------------------- WEB UI ----------------------
 String htmlPage() {
   String s;
@@ -1158,6 +1258,7 @@ void setup() {
 
   startWiFi();
   setupOTA();
+  setupOLED();
 
   server.on("/", handleRoot);
   server.on("/api/status", handleStatus);
