@@ -4,6 +4,10 @@
 #include <AccelStepper.h>
 #include <ESP32Servo.h>
 
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <HTTPClient.h>
@@ -68,6 +72,19 @@ const long RETARGET_THRESHOLD_STEPS = 250;
 const int SERVO_MIN_US = 500;
 const int SERVO_MAX_US = 2400;
 
+
+// ---------------------- OLED (SSD1306 128x64 I2C) ----------------------
+static const int OLED_W = 128;
+static const int OLED_H = 64;
+static const uint8_t OLED_ADDR = 0x3C;   // common; some modules use 0x3D
+static const int OLED_RESET_PIN = -1;    // not used with I2C modules
+
+Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, OLED_RESET_PIN);
+bool oledOk = false;
+unsigned long lastOledMs = 0;
+
+void setupOLED();
+void updateOLED();
 // ---------------------- OBSERVER LOCATION ----------------------
 // Defaults (Bakersfield-ish). These are persisted in NVS once changed via UI.
 static const double OBS_LAT_DEFAULT_DEG = 35.3733;
@@ -1183,6 +1200,7 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
+  updateOLED();
 
   // If we detected drift while tracking, stop and re-home.
   if (rehomeRequested && (homeState == ST_IDLE || homeState == ST_DONE || homeState == ST_FAIL)) {
@@ -1195,6 +1213,7 @@ void loop() {
   // Homing mode
   if (homeState != ST_IDLE && homeState != ST_DONE && homeState != ST_FAIL) {
     updateHoming();
+    updateOLED();
     return;
   }
 
