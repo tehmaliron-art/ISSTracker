@@ -105,6 +105,27 @@ static const char* ISS_URL = "https://api.wheretheiss.at/v1/satellites/25544";
 static const char* N2YO_BASE = "https://api.n2yo.com/rest/v1/satellite";
 static const char* N2YO_API_KEY = "B2A452-X29HFK-647XCY-5NME";
 
+// ---------------------- SATELLITE SELECTION (Stage 1: UI + status only) ----------------------
+// Default to ISS. Stage 2 will use this for live pointing.
+static uint32_t trackedNoradId = 25544;
+
+static const char* satNameFor(uint32_t noradId) {
+  switch (noradId) {
+    case 25544: return "ISS";
+    case 20580: return "Hubble";
+    case 48274: return "Tiangong";
+    case 25338: return "NOAA 15";
+    case 28654: return "NOAA 18";
+    case 33591: return "NOAA 19";
+    case 25994: return "Terra";
+    case 27424: return "Aqua";
+    case 39084: return "Landsat 8";
+    case 40697: return "Sentinel-2A";
+    default:    return "Custom";
+  }
+}
+
+
 // ---------------------- NETWORK TIMEOUTS ----------------------
 const uint32_t ISS_HTTP_TIMEOUT_MS = 500;  // your preference
 const uint32_t N2YO_HTTP_TIMEOUT_MS = 2500; // only fetched on boot / after pass
@@ -1137,6 +1158,31 @@ String htmlPage() {
 
 
 <div class="card">
+  <h3>Satellite</h3>
+  <div class="row">
+    <label class="lbl">Preset</label>
+    <select id="satPreset" class="text" style="min-width:240px" onchange="presetChanged()">
+      <option value="25544">ISS (SPACE STATION)</option>
+      <option value="20580">Hubble (HST)</option>
+      <option value="48274">Tiangong (CSS Tianhe-1)</option>
+      <option value="25338">NOAA 15</option>
+      <option value="28654">NOAA 18</option>
+      <option value="33591">NOAA 19</option>
+      <option value="25994">Terra</option>
+      <option value="27424">Aqua</option>
+      <option value="39084">Landsat 8</option>
+      <option value="40697">Sentinel-2A</option>
+      <option value="custom">Custom…</option>
+    </select>
+
+    <label class="lbl">NORAD</label>
+    <input id="satCustom" class="text" style="max-width:140px" placeholder="25544">
+    <button class="small" onclick="saveSat()">Set</button>
+  </div>
+  <div class="hint">Stage 1: store the selected NORAD ID; Stage 2 will use it for tracking.</div>
+</div>
+
+<div class="card">
   <h3>Status</h3>
   <div class="statusGrid">
     <div id="statusL">Loading...</div>
@@ -1168,6 +1214,42 @@ async function saveObserver(){
   // Refresh status so the UI reflects new values immediately
   await poll();
 }
+
+async function loadSat(){
+  try{
+    const r = await fetch('/api/sat');
+    const j = await r.json();
+    const id = String(j.id || '');
+    const preset = document.getElementById('satPreset');
+    const norad = document.getElementById('satNorad');
+    if (norad) norad.value = id;
+    if (preset){
+      let found = false;
+      for (const opt of preset.options){
+        if (opt.value === id){ preset.value = id; found = true; break; }
+      }
+      if (!found) preset.value = 'custom';
+    }
+  }catch(e){}
+}
+
+function satPresetChanged(){
+  const preset = document.getElementById('satPreset');
+  const norad = document.getElementById('satNorad');
+  if (!preset || !norad) return;
+  if (preset.value && preset.value !== 'custom') norad.value = preset.value;
+}
+
+async function setSat(){
+  const norad = document.getElementById('satNorad');
+  if (!norad) return;
+  const id = (norad.value || '').trim();
+  if (!/^\d+$/.test(id)) { alert('Enter a numeric NORAD ID'); return; }
+  await fetch('/api/sat/set?id=' + encodeURIComponent(id));
+  await loadSat();
+  await poll();
+}
+
 
 async function setLevel(){
   // Save current servo position as 0° elevation reference
@@ -1203,6 +1285,7 @@ function renderStatus(j){
   left.push(`<b>Level ref:</b> ${j.servoZeroDeg}&deg;`);
 
   right.push(`<b>Observer:</b> ${Number(j.obsLat).toFixed(4)}, ${Number(j.obsLon).toFixed(4)} alt ${Number(j.obsAltM).toFixed(0)}m`);
+  right.push(`<b>Satellite:</b> ${j.selSatName} (NORAD ${j.selNoradId})`);
   right.push(`<b>ISS:</b> ${Number(j.issLat).toFixed(3)}, ${Number(j.issLon).toFixed(3)} alt ${Number(j.issAltM).toFixed(0)}m`);
   right.push(`<b>Target Az/El:</b> ${Number(j.tAz).toFixed(2)}&deg; / ${Number(j.tEl).toFixed(2)}&deg;`);
 
@@ -1253,6 +1336,7 @@ async function pollLoop(){
   await poll();
   setTimeout(pollLoop, 600);
 }
+loadSat();
 pollLoop();
 </script>
 </body></html>
@@ -1285,6 +1369,8 @@ void handleStatus() {
   int pMaxAz;
 
   portENTER_CRITICAL(&dataMux);
+  uint32_t selId;
+
   lat = issLatDeg; lon = issLonDeg; altM = issAltM;
   tAz = targetAzDeg; tEl = targetElDeg;
   have = haveTarget;
@@ -1299,6 +1385,7 @@ void handleStatus() {
   pMaxUTC = nextPassMaxUTC;
   pMaxEl = nextPassMaxEl;
   pMaxAz = nextPassMaxAz;
+  selId = trackedNoradId;
   portEXIT_CRITICAL(&dataMux);
 
   String json = "{";
@@ -1311,6 +1398,8 @@ void handleStatus() {
   json += "\"homed\":" + String(isHomed ? "true" : "false") + ",";
   json += "\"hasNorthOffset\":" + String(hasNorthOffset ? "true" : "false") + ",";
   json += "\"ready\":" + String((isHomed && hasNorthOffset) ? "true" : "false") + ",";
+  json += "\"selNoradId\":" + String(selId) + ",";
+  json += "\"selSatName\":\"" + String(satNameFor(selId)) + "\",";
   json += "\"homeState\":" + String((int)homeState) + ",";
   json += "\"hallRaw\":" + String(hallRaw()) + ",";
   json += "\"hallActive\":" + String(hallActive() ? "true" : "false") + ",";
@@ -1391,6 +1480,30 @@ void handleObserverSet() {
   sendOk("observer saved");
 }
 
+
+// Satellite selection (Stage 1)
+void handleSatGet() {
+  String json = "{";
+  json += "\"id\":" + String(trackedNoradId) + ",";
+  json += "\"name\":\"" + jsonEscape(satNameForId(trackedNoradId)) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSatSet() {
+  if (!server.hasArg("id")) {
+    server.send(400, "text/plain", "missing id");
+    return;
+  }
+  long id = server.arg("id").toInt();
+  if (id < 1 || id > 99999) {
+    server.send(400, "text/plain", "invalid id");
+    return;
+  }
+  trackedNoradId = (int)id;
+  prefs.putInt("trackedNoradId", trackedNoradId);
+  sendOk("satellite set");
+}
 
 void handleHome() {
   trackingEnabled = false;
@@ -1502,6 +1615,8 @@ void handleTrackStop() {
 // Forward declarations
 void handleObserverGet();
 void handleObserverSet();
+void handleSatGet();
+void handleSatSet();
 
 void setup() {
   Serial.begin(115200);
@@ -1523,6 +1638,9 @@ void setup() {
   obsLatDeg = prefs.getDouble("obsLat", OBS_LAT_DEFAULT_DEG);
   obsLonDeg = prefs.getDouble("obsLon", OBS_LON_DEFAULT_DEG);
   obsAltM   = prefs.getDouble("obsAlt", OBS_ALT_DEFAULT_M);
+  // Load selected satellite (Stage 1: UI + status only)
+  trackedNoradId = prefs.getUInt("noradId", 25544);
+
 
   stepper.setMaxSpeed(MOVE_SPEED);
   stepper.setAcceleration(MOVE_ACCEL);
@@ -1549,6 +1667,8 @@ void setup() {
   server.on("/api/status", handleStatus);
   server.on("/api/observer", handleObserverGet);
   server.on("/api/observer/set", handleObserverSet);
+  server.on("/api/sat", handleSatGet);
+  server.on("/api/sat/set", handleSatSet);
   server.on("/api/home", handleHome);
   server.on("/api/set_north", handleSetNorth);
   server.on("/api/servo", handleServo);
