@@ -109,6 +109,9 @@ static const char* N2YO_API_KEY = "B2A452-X29HFK-647XCY-5NME";
 // Default to ISS. Stage 2 will use this for live pointing.
 static uint32_t trackedNoradId = 25544;
 
+
+// Tracking motion mode
+static bool smoothMotion = false; // if true, allow continuous retargeting (Stage 2)
 static const char* satNameFor(uint32_t noradId) {
   switch (noradId) {
     case 25544: return "ISS";
@@ -627,8 +630,8 @@ bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &maxAzOut, int
   }
 
   // Build URL:
-  // https://api.n2yo.com/rest/v1/satellite/visualpasses/25544/{lat}/{lon}/{alt_m}/{days}/{min_visibility}/&apiKey={key}
-  String url = String(N2YO_BASE) + "/visualpasses/25544/" +
+  // https://api.n2yo.com/rest/v1/satellite/visualpasses/{id}/{lat}/{lon}/{alt_m}/{days}/{min_visibility}/&apiKey={key}
+  String url = String(N2YO_BASE) + "/visualpasses/" + String(trackedNoradId) + "/"+
                String(obsLatDeg, 6) + "/" + String(obsLonDeg, 6) + "/" +
                String((int)lround(obsAltM)) + "/2/0/&apiKey=" + N2YO_API_KEY;
 
@@ -679,6 +682,141 @@ bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &maxAzOut, int
   maxUTCOut = (uint32_t)maxUTC;
   maxElOut = maxEl;
   maxAzOut = azInt;
+  return true;
+}
+
+
+// ---------------------- N2YO POSITIONS (Stage 2: live az/el) ----------------------
+struct PosSample {
+  uint32_t ts;
+  float az;
+  float el;
+  float satLat;
+  float satLon;
+  float satAltM;
+};
+
+static const uint32_t TRACK_POLL_MS = 5000;
+static const uint8_t  TRACK_SECONDS = 6;
+
+static PosSample posBuf[TRACK_SECONDS];
+volatile uint8_t posCount = 0;
+volatile uint8_t posEmitIdx = 0;
+volatile uint32_t posBaseMs = 0;
+volatile uint32_t lastPosFetchMs = 0;
+
+static bool parseJsonNumberAt(const String &body, const char *key, int start, double &out, int &nextPos) {
+  String needle = String("\"") + key + "\":";
+  int k = body.indexOf(needle, start);
+  if (k < 0) return false;
+  int vStart = k + needle.length();
+  const char *p = body.c_str() + vStart;
+  char *endp = nullptr;
+  out = strtod(p, &endp);
+  if (endp == p) return false;
+  nextPos = (int)(endp - body.c_str());
+  return true;
+}
+
+static bool fetchPositionsN2YO(uint32_t noradId, uint8_t seconds,
+                              PosSample *out, uint8_t &outCount,
+                              int &httpCode, String &err) {
+  err = "";
+  httpCode = 0;
+  outCount = 0;
+
+  if (WiFi.getMode() != WIFI_STA || WiFi.status() != WL_CONNECTED) {
+    err = "WiFi not connected";
+    return false;
+  }
+  if (seconds < 1) seconds = 1;
+  if (seconds > 60) seconds = 60;
+
+  // https://api.n2yo.com/rest/v1/satellite/positions/{id}/{lat}/{lon}/{alt_m}/{seconds}/&apiKey={key}
+  String url = String(N2YO_BASE) + "/positions/" + String(noradId) + "/" +
+               String(obsLatDeg, 6) + "/" + String(obsLonDeg, 6) + "/" +
+               String((int)lround(obsAltM)) + "/" + String((int)seconds) +
+               "/&apiKey=" + N2YO_API_KEY;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(N2YO_HTTP_TIMEOUT_MS);
+
+  HTTPClient http;
+  http.setTimeout(N2YO_HTTP_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  if (!http.begin(client, url)) {
+    err = "http.begin() failed";
+    return false;
+  }
+
+  int code = http.GET();
+  httpCode = code;
+
+  if (code <= 0) {
+    err = String("GET failed: ") + http.errorToString(code);
+    http.end();
+    return false;
+  }
+  if (code != 200) {
+    err = String("HTTP ") + code;
+    http.end();
+    return false;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  int arr = body.indexOf("\"positions\"");
+  if (arr < 0) { err = "parse positions[]"; return false; }
+  int p = body.indexOf('[', arr);
+  if (p < 0) { err = "parse positions["; return false; }
+
+  uint8_t count = 0;
+  int cur = p + 1;
+  while (count < seconds) {
+    int obj = body.indexOf('{', cur);
+    if (obj < 0) break;
+    int objEnd = body.indexOf('}', obj);
+    if (objEnd < 0) break;
+
+    double ts=0, az=0, el=0, slat=0, slon=0, saltKm=0;
+    int np=0;
+
+    if (!parseJsonNumberAt(body, "timestamp", obj, ts, np)) { cur = objEnd + 1; continue; }
+    if (!parseJsonNumberAt(body, "azimuth",   obj, az, np)) { cur = objEnd + 1; continue; }
+    if (!parseJsonNumberAt(body, "elevation", obj, el, np)) { cur = objEnd + 1; continue; }
+
+    // optional sat position values (nice for status display)
+    parseJsonNumberAt(body, "satlatitude",  obj, slat, np);
+    parseJsonNumberAt(body, "satlongitude", obj, slon, np);
+    parseJsonNumberAt(body, "sataltitude",  obj, saltKm, np); // km
+
+    out[count].ts = (uint32_t)ts;
+    out[count].az = (float)az;
+    out[count].el = (float)el;
+    out[count].satLat = (float)slat;
+    out[count].satLon = (float)slon;
+    out[count].satAltM = (float)(saltKm * 1000.0);
+
+    count++;
+    cur = objEnd + 1;
+  }
+
+  outCount = count;
+
+  // Use N2YO timestamp as a lightweight Unix time source
+  if (outCount > 0 && out[0].ts > 0) {
+    timeBaseEpoch = out[0].ts;
+    timeBaseMillis = millis();
+    timeSynced = true;
+  }
+
+  if (outCount == 0) {
+    err = "no position samples";
+    return false;
+  }
   return true;
 }
 
@@ -737,51 +875,89 @@ void issTask(void* pv) {
       continue;
     }
 
-    double lat = 0, lon = 0, altM = 0;
+    
     int code = 0;
     String err;
 
-    bool ok = fetchIssOnce(lat, lon, altM, code, err);
+    // Fetch a batch of az/el samples every TRACK_POLL_MS
+    uint32_t nowMs = millis();
+    bool needFetch = false;
 
     portENTER_CRITICAL(&dataMux);
-    lastIssHttpCode = code;
-    lastIssErr = err;
-
-    if (ok) {
-      issLatDeg = lat;
-      issLonDeg = lon;
-      issAltM   = altM;
-
-      double az, el;
-      computeAzElDeg(obsLatDeg, obsLonDeg, obsAltM,
-                     lat, lon, altM,
-                     az, el);
-
-      targetAzDeg = az;
-      targetElDeg = el;
-      haveTarget = true;
-
-      // Queue latest target for main loop to commit when stepper is ready
-      pendingAzDeg = az;
-      pendingElDeg = el;
-      havePendingTarget = true;
-
-      lastIssOkMs = millis();
-
-      // Elevation hysteresis
-      if (!fastMode) {
-        if (el >= FAST_ENTER_EL_DEG) fastMode = true;
-      } else {
-        if (el <= FAST_EXIT_EL_DEG) fastMode = false;
-      }
-
-      pollMs = fastMode ? ISS_POLL_FAST_MS : ISS_POLL_SLOW_MS;
-    }
-
-    taskPollMs = pollMs;
+    uint32_t lastFetch = lastPosFetchMs;
+    uint8_t  cnt = posCount;
     portEXIT_CRITICAL(&dataMux);
 
-    vTaskDelay(pdMS_TO_TICKS(pollMs));
+    if (cnt == 0) needFetch = true;
+    if (nowMs - lastFetch >= TRACK_POLL_MS) needFetch = true;
+
+    if (needFetch) {
+      PosSample tmp[TRACK_SECONDS];
+      uint8_t outCount = 0;
+      bool ok = fetchPositionsN2YO(trackedNoradId, TRACK_SECONDS, tmp, outCount, code, err);
+
+      portENTER_CRITICAL(&dataMux);
+      lastIssHttpCode = code;
+      lastIssErr = err;
+
+      if (ok) {
+        for (uint8_t i = 0; i < outCount && i < TRACK_SECONDS; i++) posBuf[i] = tmp[i];
+        posCount = outCount;
+        posEmitIdx = 0;
+        posBaseMs = millis();
+        lastPosFetchMs = posBaseMs;
+
+        // Update status fields when available
+        issLatDeg = tmp[0].satLat;
+        issLonDeg = tmp[0].satLon;
+        issAltM   = tmp[0].satAltM;
+
+        lastIssOkMs = millis();
+      }
+      taskPollMs = TRACK_POLL_MS;
+      fastMode = false;
+      portEXIT_CRITICAL(&dataMux);
+    }
+
+    // Emit one target per second from the current buffer (indexes 0..4). Index 5 is lookahead.
+    static uint32_t nextEmitMs = 0;
+    if (nextEmitMs == 0) nextEmitMs = millis();
+
+    if (millis() >= nextEmitMs) {
+      uint8_t emitIdx;
+      uint8_t haveCnt;
+      PosSample sample;
+
+      portENTER_CRITICAL(&dataMux);
+      emitIdx = posEmitIdx;
+      haveCnt = posCount;
+      if (haveCnt > emitIdx && emitIdx < TRACK_SECONDS) sample = posBuf[emitIdx];
+      portEXIT_CRITICAL(&dataMux);
+
+      if (haveCnt >= 5 && emitIdx < 5) {
+        double az = sample.az;
+        double el = sample.el;
+
+        portENTER_CRITICAL(&dataMux);
+        targetAzDeg = az;
+        targetElDeg = el;
+        haveTarget = true;
+
+        pendingAzDeg = az;
+        pendingElDeg = el;
+        havePendingTarget = true;
+
+        posEmitIdx = emitIdx + 1;
+        portEXIT_CRITICAL(&dataMux);
+
+        nextEmitMs += 1000;
+      } else {
+        nextEmitMs = millis() + 200;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
   }
 }
 
@@ -798,7 +974,7 @@ void updateTrackingMotion() {
   bool pending = havePendingTarget;
   if (pending) {
     // Only commit a new target when we're close to finishing the current one
-    if (labs(stepper.distanceToGo()) <= RETARGET_THRESHOLD_STEPS || stepper.distanceToGo() == 0) {
+    if (smoothMotion || labs(stepper.distanceToGo()) <= RETARGET_THRESHOLD_STEPS || stepper.distanceToGo() == 0) {
       az = pendingAzDeg;
       el = pendingElDeg;
       havePendingTarget = false;
@@ -1161,7 +1337,7 @@ String htmlPage() {
   <h3>Satellite</h3>
   <div class="row">
     <label class="lbl">Preset</label>
-    <select id="satPreset" class="text" style="min-width:240px" onchange="presetChanged()">
+    <select id="satPreset" class="text" style="min-width:240px" onchange="satPresetChanged()">
       <option value="25544">ISS (SPACE STATION)</option>
       <option value="20580">Hubble (HST)</option>
       <option value="48274">Tiangong (CSS Tianhe-1)</option>
@@ -1176,8 +1352,10 @@ String htmlPage() {
     </select>
 
     <label class="lbl">NORAD</label>
-    <input id="satCustom" class="text" style="max-width:140px" placeholder="25544">
-    <button class="small" onclick="saveSat()">Set</button>
+    <input id="satNorad" class="text" style="max-width:140px" placeholder="25544">
+    <button class="small" onclick="setSat()">Set</button>
+    <label class="lbl" style="margin-left:14px">Smooth</label>
+    <input type="checkbox" id="smoothMotion" onclick="setSmooth()">
   </div>
   <div class="hint">Stage 1: store the selected NORAD ID; Stage 2 will use it for tracking.</div>
 </div>
@@ -1231,6 +1409,23 @@ async function loadSat(){
       if (!found) preset.value = 'custom';
     }
   }catch(e){}
+
+async function loadSmooth(){
+  try{
+    const r = await fetch('/api/smooth');
+    const j = await r.json();
+    const cb = document.getElementById('smoothMotion');
+    if (cb) cb.checked = !!j.smooth;
+  }catch(e){}
+}
+
+async function setSmooth(){
+  const cb = document.getElementById('smoothMotion');
+  const on = (cb && cb.checked) ? 1 : 0;
+  await fetch('/api/smooth/set?on=' + on);
+  await poll();
+}
+
 }
 
 function satPresetChanged(){
@@ -1247,6 +1442,7 @@ async function setSat(){
   if (!/^\d+$/.test(id)) { alert('Enter a numeric NORAD ID'); return; }
   await fetch('/api/sat/set?id=' + encodeURIComponent(id));
   await loadSat();
+loadSmooth();
   await poll();
 }
 
@@ -1485,7 +1681,7 @@ void handleObserverSet() {
 void handleSatGet() {
   String json = "{";
   json += "\"id\":" + String(trackedNoradId) + ",";
-  json += "\"name\":\"" + jsonEscape(satNameForId(trackedNoradId)) + "\"";
+  json += "\"name\":\"" + jsonEscape(String(satNameFor(trackedNoradId))) + "\"";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -1639,7 +1835,8 @@ void setup() {
   obsLonDeg = prefs.getDouble("obsLon", OBS_LON_DEFAULT_DEG);
   obsAltM   = prefs.getDouble("obsAlt", OBS_ALT_DEFAULT_M);
   // Load selected satellite (Stage 1: UI + status only)
-  trackedNoradId = prefs.getUInt("noradId", 25544);
+  trackedNoradId = prefs.getUInt("trackedNoradId", 25544);
+  smoothMotion = prefs.getBool("smoothMotion", false);
 
 
   stepper.setMaxSpeed(MOVE_SPEED);
@@ -1656,7 +1853,10 @@ void setup() {
     double lat=0, lon=0, altM=0;
     int code=0;
     String err;
-    fetchIssOnce(lat, lon, altM, code, err); // sets timeSynced via "timestamp" when available
+    // Use a single N2YO positions call to seed time (timestamp) and status
+    PosSample tmp[TRACK_SECONDS];
+    uint8_t outCount=0;
+    fetchPositionsN2YO(trackedNoradId, 1, tmp, outCount, code, err);
     ensureNextPass(true);
   }
 
@@ -1669,6 +1869,8 @@ void setup() {
   server.on("/api/observer/set", handleObserverSet);
   server.on("/api/sat", handleSatGet);
   server.on("/api/sat/set", handleSatSet);
+  server.on("/api/smooth", handleSmoothGet);
+  server.on("/api/smooth/set", handleSmoothSet);
   server.on("/api/home", handleHome);
   server.on("/api/set_north", handleSetNorth);
   server.on("/api/servo", handleServo);
