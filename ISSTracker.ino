@@ -718,6 +718,8 @@ static bool parseJsonNumberAt(const String &body, const char *key, int start, do
   return true;
 }
 
+struct PosSample; // forward decl for pointer params
+
 static bool fetchPositionsN2YO(uint32_t noradId, uint8_t seconds,
                               PosSample *out, uint8_t &outCount,
                               int &httpCode, String &err) {
@@ -1814,6 +1816,27 @@ void handleObserverSet();
 void handleSatGet();
 void handleSatSet();
 
+
+// -------------------------
+// Smooth motion API handlers (Stage 2)
+// -------------------------
+void handleSmoothGet() {
+  String json = String("{\"on\":") + (smoothMotion ? "true" : "false") + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSmoothSet() {
+  // expects on=0|1
+  bool on = false;
+  if (server.hasArg("on")) {
+    String v = server.arg("on");
+    v.toLowerCase();
+    on = (v == "1" || v == "true" || v == "on" || v == "yes");
+  }
+  smoothMotion = on;
+  prefs.putBool("smoothMotion", smoothMotion);
+  handleSmoothGet();
+}
 void setup() {
   Serial.begin(115200);
   delay(200);
