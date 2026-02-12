@@ -1,3 +1,13 @@
+// ---- N2YO positions sample type (must be before Arduino auto-prototypes) ----
+struct PosSample {
+  uint32_t ts;
+  float az;
+  float el;
+  float satLat;
+  float satLon;
+  float satAltM;
+};
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
@@ -687,15 +697,7 @@ bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &maxAzOut, int
 
 
 // ---------------------- N2YO POSITIONS (Stage 2: live az/el) ----------------------
-typedef struct PosSample PosSample;
-struct PosSample {
-  uint32_t ts;
-  float az;
-  float el;
-  float satLat;
-  float satLon;
-  float satAltM;
-};
+// PosSample struct is declared at the top of the file (before includes) to satisfy Arduino auto-prototypes.
 
 static const uint32_t TRACK_POLL_MS = 5000;
 static const uint8_t  TRACK_SECONDS = 6;
