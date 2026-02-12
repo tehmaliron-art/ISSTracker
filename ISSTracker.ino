@@ -687,6 +687,7 @@ bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &maxAzOut, int
 
 
 // ---------------------- N2YO POSITIONS (Stage 2: live az/el) ----------------------
+typedef struct PosSample PosSample;
 struct PosSample {
   uint32_t ts;
   float az;
@@ -718,7 +719,6 @@ static bool parseJsonNumberAt(const String &body, const char *key, int start, do
   return true;
 }
 
-struct PosSample; // forward decl for pointer params
 
 static bool fetchPositionsN2YO(uint32_t noradId, uint8_t seconds,
                               PosSample *out, uint8_t &outCount,
