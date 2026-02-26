@@ -160,6 +160,19 @@ static double nextPassMaxEl = 0.0;
 static int nextPassMaxAz = -1; // degrees, 0-359; -1 unknown
 static unsigned long lastN2yoFetchMs = 0;
 
+static void invalidateNextPassCache(const char* reason) {
+  haveNextPass = false;
+  nextPassMaxUTC = 0;
+  nextPassMaxEl = 0.0;
+  nextPassMaxAz = -1;
+  // Allow an immediate refetch when requested.
+  lastN2yoFetchMs = 0;
+  if (reason) {
+    Serial.printf("[PASS] Cache invalidated: %s\n", reason);
+  }
+}
+
+
 
 // Dynamic polling based on elevation (hysteresis)
 const uint32_t ISS_POLL_SLOW_MS = 2000;
@@ -643,7 +656,7 @@ bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &maxAzOut, int
   // https://api.n2yo.com/rest/v1/satellite/visualpasses/{id}/{lat}/{lon}/{alt_m}/{days}/{min_visibility}/&apiKey={key}
   String url = String(N2YO_BASE) + "/visualpasses/" + String(trackedNoradId) + "/"+
                String(obsLatDeg, 6) + "/" + String(obsLonDeg, 6) + "/" +
-               String((int)lround(obsAltM)) + "/2/0/&apiKey=" + N2YO_API_KEY;
+               String((int)lround(obsAltM)) + "/2/30/&apiKey=" + N2YO_API_KEY;
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -834,7 +847,8 @@ void ensureNextPass(bool forceFetch) {
   }
 
   // Throttle retries in case of temporary failures.
-  if (millis() - lastN2yoFetchMs < 60000) return;
+  // If forceFetch is requested (e.g., sat/observer changed), bypass this throttle.
+  if (!forceFetch && (millis() - lastN2yoFetchMs < 60000)) return;
 
   uint32_t maxUTC = 0;
   double maxEl = 0;
@@ -1184,7 +1198,8 @@ void updateOLED() {
 
   // Line 4: ISS lat/lon (rounded)
   oled.setCursor(0, 30);
-  oled.print("ISS ");
+  oled.print(satNameFor(trackedNoradId));
+  oled.print(" ");
   oled.print(issLat, 1);
   oled.print(",");
   oled.print(issLon, 1);
@@ -1486,11 +1501,11 @@ function renderStatus(j){
 
   right.push(`<b>Observer:</b> ${Number(j.obsLat).toFixed(4)}, ${Number(j.obsLon).toFixed(4)} alt ${Number(j.obsAltM).toFixed(0)}m`);
   right.push(`<b>Satellite:</b> ${j.selSatName} (NORAD ${j.selNoradId})`);
-  right.push(`<b>ISS:</b> ${Number(j.issLat).toFixed(3)}, ${Number(j.issLon).toFixed(3)} alt ${Number(j.issAltM).toFixed(0)}m`);
+  right.push(`<b>${j.selSatName}:</b> ${Number(j.issLat).toFixed(3)}, ${Number(j.issLon).toFixed(3)} alt ${Number(j.issAltM).toFixed(0)}m`);
   right.push(`<b>Target Az/El:</b> ${Number(j.tAz).toFixed(2)}&deg; / ${Number(j.tEl).toFixed(2)}&deg;`);
 
   if (j.haveNextPass && j.timeSynced) {
-    let line = `<b>Next pass (max):</b> in ${fmtDt(j.nextPassDt)} (P${Math.round(j.nextPassMaxEl)}&deg;`;
+    let line = `<b>Next pass (max):</b> in ${fmtDt(j.nextPassDt)} for ${j.selSatName} (P${Math.round(j.nextPassMaxEl)}&deg;`;
     if (j.nextPassMaxAz >= 0) {
       const comp = (j.nextPassAzComp || '').trim();
       line += `, Az ${Math.round(j.nextPassMaxAz)}&deg; ${comp}`;
@@ -1677,6 +1692,9 @@ void handleObserverSet() {
   prefs.putDouble("obsLon", obsLonDeg);
   prefs.putDouble("obsAlt", obsAltM);
 
+  invalidateNextPassCache("observer changed");
+  ensureNextPass(true);
+
   sendOk("observer saved");
 }
 
@@ -1700,8 +1718,12 @@ void handleSatSet() {
     server.send(400, "text/plain", "invalid id");
     return;
   }
-  trackedNoradId = (int)id;
-  prefs.putInt("trackedNoradId", trackedNoradId);
+  trackedNoradId = (uint32_t)id;
+  prefs.putUInt("trackedNoradId", trackedNoradId);
+
+  invalidateNextPassCache("satellite changed");
+  ensureNextPass(true);
+
   sendOk("satellite set");
 }
 
