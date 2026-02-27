@@ -1304,11 +1304,11 @@ String htmlPage() {
   <div class="row" style="margin-top:8px">
     <label class="lbl">OTA Pass</label>
     <input id="otaPass" class="text" type="text" style="min-width:220px" placeholder="OTA password">
-    <button class="small" onclick="saveNetwork()">Save &amp; Reboot</button>
   </div>
   <div class="row" style="margin-top:8px">
     <label class="lbl">N2YO Key</label>
     <input id="n2yoKey" class="text" type="text" style="min-width:320px" placeholder="N2YO API key">
+    <button class="small" onclick="saveNetwork()">Save All &amp; Reboot</button>
   </div>
   <div class="hint">If no Wi-Fi is saved, the tracker starts in fallback AP mode. Saved Wi-Fi, OTA, and N2YO credentials are shown here.</div>
 </div>
@@ -1392,9 +1392,8 @@ async function saveNetwork(){
   const pass = document.getElementById('wifiPass').value;
   const ota = document.getElementById('otaPass').value;
   const n2yo = document.getElementById('n2yoKey').value;
-  await fetch(`/api/n2yo/set?key=${encodeURIComponent(n2yo)}`);
-  await fetch(`/api/network/set?ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}&ota=${encodeURIComponent(ota)}`);
-  alert('Network settings saved. Device is rebooting.');
+  await fetch(`/api/network/set?ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}&ota=${encodeURIComponent(ota)}&n2yo=${encodeURIComponent(n2yo)}`);
+  alert('Settings saved. Device is rebooting.');
 }
 
 async function loadSat(){
@@ -1744,9 +1743,13 @@ void handleNetworkSet() {
   String ssid = server.hasArg("ssid") ? server.arg("ssid") : String("");
   String pass = server.hasArg("pass") ? server.arg("pass") : String("");
   String ota  = server.hasArg("ota")  ? server.arg("ota")  : String("");
+  String n2yo = server.hasArg("n2yo") ? server.arg("n2yo") : String("");
   ssid.trim();
+  pass.trim();
+  ota.trim();
+  n2yo.trim();
 
-  if (ssid.length() > 32 || pass.length() > 64 || ota.length() > 64) {
+  if (ssid.length() > 32 || pass.length() > 64 || ota.length() > 64 || n2yo.length() > 64) {
     server.send(400, "text/plain", "value too long");
     return;
   }
@@ -1766,6 +1769,9 @@ void handleNetworkSet() {
     copyStringToBuf(ota, otaPassword, sizeof(otaPassword));
     prefs.putString("otaPass", String(otaPassword));
   }
+
+  copyStringToBuf(n2yo, n2yoApiKey, sizeof(n2yoApiKey));
+  prefs.putString("n2yoKey", String(n2yoApiKey));
 
   char msg[96];
   snprintf(msg, sizeof(msg), "net save ssid=%s ota=%s",
