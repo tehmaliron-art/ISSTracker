@@ -1083,94 +1083,65 @@ void updateOLED() {
   if (now - lastOledMs < 500) return;
   lastOledMs = now;
 
-  // Snapshot shared data
-  double issLat = 0, issLon = 0, tAz = 0, tEl = 0;
-  unsigned long ageMs = 0;
-  int httpCode = 0;
-  portENTER_CRITICAL(&dataMux);
-  issLat = issLatDeg;
-  issLon = issLonDeg;
-  tAz = targetAzDeg;
-  tEl = targetElDeg;
-  httpCode = lastIssHttpCode;
-  ageMs = (lastIssOkMs == 0) ? 0 : (millis() - lastIssOkMs);
-  portEXIT_CRITICAL(&dataMux);
-
   String ipStr = (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED)
                    ? WiFi.localIP().toString()
                    : WiFi.softAPIP().toString();
 
-  oled.clearDisplay();
-  oled.setTextSize(1);
-  oled.setTextColor(SSD1306_WHITE);
+  const char* state = uiStateLabel();
+  const char* sat = satNameFor(trackedNoradId);
 
-  // Line 1: IP
-  oled.setCursor(0, 0);
-  oled.print("IP ");
-  oled.print(ipStr);
-
-  // Line 2: RSSI + state
-  oled.setCursor(0, 10);
-  oled.print("RSSI ");
-  oled.print(WiFi.RSSI());
-  oled.print("  ");
-  oled.print(uiStateLabel());
-
-  // Line 3: readiness / hints
-  oled.setCursor(0, 20);
-  if (!isHomed) {
-    oled.print("Need: HOME");
-  } else if (!hasNorthOffset) {
-    oled.print("Need: SET NORTH");
-  } else {
-    oled.print("Az ");
-    oled.print(tAz, 0);
-    oled.print(" El ");
-    oled.print(tEl, 0);
-  }
-
-  // Line 4: selected satellite lat/lon (rounded)
-  oled.setCursor(0, 30);
-  oled.print(satNameFor(trackedNoradId));
-  oled.print(" ");
-  oled.print(issLat, 1);
-  oled.print(",");
-  oled.print(issLon, 1);
-
-  // Line 5: data age / HTTP
-  oled.setCursor(0, 40);
-  oled.print("Age ");
-  oled.print((unsigned long)(ageMs / 1000));
-  oled.print("s  H ");
-  oled.print(httpCode);
-
-  // Line 6: pass stub (we'll fill later)
-  oled.setCursor(0, 50);
-  // Line 6: next overhead (from N2YO) countdown to maxUTC
+  char nextBuf[20];
   if (haveNextPass && timeSynced) {
     int32_t dt = (int32_t)nextPassMaxUTC - (int32_t)nowEpoch();
     if (dt < 0) dt = 0;
-    char buf[16];
+
+    const char* comp = (nextPassMaxAz >= 0) ? azToCompass8(nextPassMaxAz) : "";
     if (dt >= 3600) {
       int h = dt / 3600;
       int m = (dt % 3600) / 60;
-      snprintf(buf, sizeof(buf), "Next %dh%02dm", h, m);
+      if (comp[0]) snprintf(nextBuf, sizeof(nextBuf), "%dh%02dm %s", h, m, comp);
+      else         snprintf(nextBuf, sizeof(nextBuf), "%dh%02dm", h, m);
     } else {
       int m = dt / 60;
       int s = dt % 60;
-      snprintf(buf, sizeof(buf), "Next %dm%02ds", m, s);
-    }
-    oled.print(buf);
-    oled.print(" P");
-    oled.print((int)lround(nextPassMaxEl));
-    if (nextPassMaxAz >= 0) {
-      oled.print(" A");
-      oled.print(nextPassMaxAz);
-      oled.print(azToCompass8(nextPassMaxAz));
+      if (comp[0]) snprintf(nextBuf, sizeof(nextBuf), "%dm%02ds %s", m, s, comp);
+      else         snprintf(nextBuf, sizeof(nextBuf), "%dm%02ds", m, s);
     }
   } else {
-    oled.print("Next TBD");
+    snprintf(nextBuf, sizeof(nextBuf), "Next TBD");
   }
+
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+
+  int ipSize = ((int)ipStr.length() * 12 <= OLED_W) ? 2 : 1;
+  int ipCharW = 6 * ipSize;
+  int stateY = (ipSize == 2) ? 16 : 12;
+  int satY = stateY + 18;
+
+  oled.setTextSize(ipSize);
+  int x = (OLED_W - ((int)ipStr.length() * ipCharW)) / 2;
+  if (x < 0) x = 0;
+  oled.setCursor(x, 0);
+  oled.print(ipStr);
+
+  oled.setTextSize(2);
+  x = (OLED_W - ((int)strlen(state) * 12)) / 2;
+  if (x < 0) x = 0;
+  oled.setCursor(x, stateY);
+  oled.print(state);
+
+  oled.setTextSize(1);
+  x = (OLED_W - ((int)strlen(sat) * 6)) / 2;
+  if (x < 0) x = 0;
+  oled.setCursor(x, satY);
+  oled.print(sat);
+
+  oled.setTextSize(2);
+  x = (OLED_W - ((int)strlen(nextBuf) * 12)) / 2;
+  if (x < 0) x = 0;
+  oled.setCursor(x, 46);
+  oled.print(nextBuf);
 
   oled.display();
 }
@@ -1204,6 +1175,7 @@ String htmlPage() {
 
   body { font-family: system-ui, sans-serif; margin: 16px; background: var(--bg); color: var(--text); }
   h2 { text-align: center; margin: 10px 0 16px; letter-spacing: 0.2px; }
+  h3 { margin: 0 0 10px; }
   .wrap { max-width: 980px; margin: 0 auto; }
 
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 14px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.25); }
@@ -1214,7 +1186,7 @@ String htmlPage() {
   button.danger { border-color: rgba(208,99,108,0.75); }
 
   .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-  .label { min-width: 140px; font-weight: 600; color: var(--muted); }
+  .lbl, .label { min-width: 140px; font-weight: 600; color: var(--muted); }
   code { background: rgba(255,255,255,0.06); padding: 2px 6px; border-radius: 6px; }
 
   .controlsTop { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; justify-content: center; }
