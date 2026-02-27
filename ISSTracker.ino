@@ -230,10 +230,48 @@ volatile int lastIssHttpCode = 0;
 volatile unsigned long lastIssOkMs = 0;
 String lastIssErr = "";
 
+static const uint8_t EVENT_LOG_SIZE = 20;
+static const uint8_t EVENT_LOG_MSG_MAX = 88;
+static char eventLog[EVENT_LOG_SIZE][EVENT_LOG_MSG_MAX];
+static uint8_t eventLogHead = 0;
+static uint8_t eventLogCount = 0;
+
 volatile bool fastMode = false;      // hysteresis state
 volatile uint32_t taskPollMs = 0;    // for UI debugging
 
 TaskHandle_t issTaskHandle = nullptr;
+
+void logEvent(const char* tag, const char* msg) {
+  char line[EVENT_LOG_MSG_MAX];
+  uint32_t t = millis() / 1000;
+  snprintf(line, sizeof(line), "%lus %s %s", (unsigned long)t, tag ? tag : "EV", msg ? msg : "");
+
+  portENTER_CRITICAL(&dataMux);
+  strncpy(eventLog[eventLogHead], line, EVENT_LOG_MSG_MAX - 1);
+  eventLog[eventLogHead][EVENT_LOG_MSG_MAX - 1] = '\0';
+  eventLogHead = (uint8_t)((eventLogHead + 1) % EVENT_LOG_SIZE);
+  if (eventLogCount < EVENT_LOG_SIZE) eventLogCount++;
+  portEXIT_CRITICAL(&dataMux);
+
+  Serial.printf("[EVT] %s\n", line);
+}
+
+const char* httpErrorName(int code) {
+  switch (code) {
+    case HTTPC_ERROR_CONNECTION_REFUSED: return "CONNECTION_REFUSED";
+    case HTTPC_ERROR_SEND_HEADER_FAILED: return "SEND_HEADER_FAILED";
+    case HTTPC_ERROR_SEND_PAYLOAD_FAILED: return "SEND_PAYLOAD_FAILED";
+    case HTTPC_ERROR_NOT_CONNECTED: return "NOT_CONNECTED";
+    case HTTPC_ERROR_CONNECTION_LOST: return "CONNECTION_LOST";
+    case HTTPC_ERROR_NO_STREAM: return "NO_STREAM";
+    case HTTPC_ERROR_NO_HTTP_SERVER: return "NO_HTTP_SERVER";
+    case HTTPC_ERROR_TOO_LESS_RAM: return "TOO_LESS_RAM";
+    case HTTPC_ERROR_ENCODING: return "ENCODING";
+    case HTTPC_ERROR_STREAM_WRITE: return "STREAM_WRITE";
+    case HTTPC_ERROR_READ_TIMEOUT: return "READ_TIMEOUT";
+    default: return "UNKNOWN";
+  }
+}
 
 // ---------------------- HELPERS ----------------------
 int hallRaw() { return digitalRead(HALL_PIN); }
@@ -438,12 +476,14 @@ void finishHoming(bool success) {
   stepper.stop();
 
   if (!success) {
+    logEvent("HOME", "homing failed (timeout)");
     homeState = ST_FAIL;
     isHomed = false;
     prefs.putBool("isHomed", false);
     trackingEnabled = false;
     manualOverride = true;
   } else {
+    logEvent("HOME", "homing complete");
     homeState = ST_DONE;
     isHomed = true;
     prefs.putBool("isHomed", true);
@@ -591,7 +631,7 @@ bool fetchIssOnce(double &lat, double &lon, double &altM_out, int &httpCode, Str
   httpCode = 0;
 
   if (WiFi.getMode() != WIFI_STA || WiFi.status() != WL_CONNECTED) {
-    err = "WiFi not connected";
+    err = String("WiFi not connected (mode=") + wifiModeString() + ", status=" + String((int)WiFi.status()) + ")";
     return false;
   }
 
@@ -612,7 +652,7 @@ bool fetchIssOnce(double &lat, double &lon, double &altM_out, int &httpCode, Str
   httpCode = code;
 
   if (code <= 0) {
-    err = String("GET failed: ") + http.errorToString(code);
+    err = String("GET failed ") + code + " (" + httpErrorName(code) + "): " + http.errorToString(code);
     http.end();
     return false;
   }
@@ -648,7 +688,7 @@ bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &maxAzOut, int
   httpCode = 0;
 
   if (WiFi.getMode() != WIFI_STA || WiFi.status() != WL_CONNECTED) {
-    err = "WiFi not connected";
+    err = String("WiFi not connected (mode=") + wifiModeString() + ", status=" + String((int)WiFi.status()) + ")";
     return false;
   }
 
@@ -675,7 +715,7 @@ bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &maxAzOut, int
   httpCode = code;
 
   if (code <= 0) {
-    err = String("GET failed: ") + http.errorToString(code);
+    err = String("GET failed ") + code + " (" + httpErrorName(code) + "): " + http.errorToString(code);
     http.end();
     return false;
   }
@@ -743,7 +783,7 @@ static bool fetchPositionsN2YO(uint32_t noradId, uint8_t seconds,
   outCount = 0;
 
   if (WiFi.getMode() != WIFI_STA || WiFi.status() != WL_CONNECTED) {
-    err = "WiFi not connected";
+    err = String("WiFi not connected (mode=") + wifiModeString() + ", status=" + String((int)WiFi.status()) + ")";
     return false;
   }
   if (seconds < 1) seconds = 1;
@@ -772,7 +812,7 @@ static bool fetchPositionsN2YO(uint32_t noradId, uint8_t seconds,
   httpCode = code;
 
   if (code <= 0) {
-    err = String("GET failed: ") + http.errorToString(code);
+    err = String("GET failed ") + code + " (" + httpErrorName(code) + "): " + http.errorToString(code);
     http.end();
     return false;
   }
@@ -839,7 +879,10 @@ static bool fetchPositionsN2YO(uint32_t noradId, uint8_t seconds,
 
 void ensureNextPass(bool forceFetch) {
   // Avoid hammering the API if WiFi just came up or time is not synced yet.
-  if (WiFi.getMode() != WIFI_STA || WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.getMode() != WIFI_STA || WiFi.status() != WL_CONNECTED) {
+    if (forceFetch) logEvent("PASS", "skip refresh: wifi not connected");
+    return;
+  }
 
   if (!forceFetch && haveNextPass && timeSynced) {
     int32_t dt = (int32_t)nextPassMaxUTC - (int32_t)nowEpoch();
@@ -868,8 +911,15 @@ void ensureNextPass(bool forceFetch) {
                   (unsigned long)nextPassMaxUTC,
                   timeSynced ? (long)((int32_t)nextPassMaxUTC - (int32_t)nowEpoch()) : -1L,
                   nextPassMaxEl);
+    char msg[72];
+    snprintf(msg, sizeof(msg), "refresh ok sat=%lu dt=%ld el=%.0f", (unsigned long)trackedNoradId,
+             timeSynced ? (long)((int32_t)nextPassMaxUTC - (int32_t)nowEpoch()) : -1L, nextPassMaxEl);
+    logEvent("PASS", msg);
   } else {
     Serial.printf("[PASS] N2YO fetch failed (HTTP %d): %s\n", code, err.c_str());
+    char msg[72];
+    snprintf(msg, sizeof(msg), "refresh fail http=%d %s", code, err.c_str());
+    logEvent("PASS", msg);
   }
 }
 
@@ -879,6 +929,8 @@ void issTask(void* pv) {
   uint32_t pollMs = ISS_POLL_SLOW_MS;
   fastMode = false;
   taskPollMs = pollMs;
+
+  bool hadRecentIssFailure = false;
 
   for (;;) {
     // If we aren't tracking or user is manually controlling, idle
@@ -931,6 +983,17 @@ void issTask(void* pv) {
         issAltM   = tmp[0].satAltM;
 
         lastIssOkMs = millis();
+        if (hadRecentIssFailure) {
+          hadRecentIssFailure = false;
+          char msg[72];
+          snprintf(msg, sizeof(msg), "recovered sat=%lu samples=%u", (unsigned long)trackedNoradId, (unsigned)outCount);
+          logEvent("ISS", msg);
+        }
+      } else {
+        hadRecentIssFailure = true;
+        char msg[72];
+        snprintf(msg, sizeof(msg), "fetch fail sat=%lu http=%d", (unsigned long)trackedNoradId, code);
+        logEvent("ISS", msg);
       }
       taskPollMs = TRACK_POLL_MS;
       fastMode = false;
@@ -1196,7 +1259,7 @@ void updateOLED() {
     oled.print(tEl, 0);
   }
 
-  // Line 4: ISS lat/lon (rounded)
+  // Line 4: selected satellite lat/lon (rounded)
   oled.setCursor(0, 30);
   oled.print(satNameFor(trackedNoradId));
   oled.print(" ");
@@ -1387,8 +1450,10 @@ String htmlPage() {
   </div>
 </div>
 
-
-
+<div class="card">
+  <h3>Event Log</h3>
+  <div id="eventLog" style="white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12px;max-height:220px;overflow:auto;background:rgba(255,255,255,0.03);padding:10px;border-radius:10px;border:1px solid var(--border)">Loading...</div>
+</div>
 
 <script>
 async function api(url){ try { await fetch(url); } catch(e) {} }
@@ -1428,13 +1493,14 @@ async function loadSat(){
       if (!found) preset.value = 'custom';
     }
   }catch(e){}
+}
 
 async function loadSmooth(){
   try{
     const r = await fetch('/api/smooth');
     const j = await r.json();
     const cb = document.getElementById('smoothMotion');
-    if (cb) cb.checked = !!j.smooth;
+    if (cb) cb.checked = !!j.on;
   }catch(e){}
 }
 
@@ -1445,7 +1511,6 @@ async function setSmooth(){
   await poll();
 }
 
-}
 
 function satPresetChanged(){
   const preset = document.getElementById('satPreset');
@@ -1461,7 +1526,7 @@ async function setSat(){
   if (!/^\d+$/.test(id)) { alert('Enter a numeric NORAD ID'); return; }
   await fetch('/api/sat/set?id=' + encodeURIComponent(id));
   await loadSat();
-loadSmooth();
+  await loadSmooth();
   await poll();
 }
 
@@ -1547,11 +1612,26 @@ async function poll(){
     document.getElementById('statusL').innerText = 'Status fetch failed';
   }
 }
+async function pollEvents(){
+  try{
+    const r = await fetch('/api/events');
+    const j = await r.json();
+    const lines = (j.events || []).map(v => String(v));
+    const el = document.getElementById('eventLog');
+    if (el) el.textContent = lines.length ? lines.join("\n") : "(no events yet)";
+  }catch(e){
+    const el = document.getElementById('eventLog');
+    if (el) el.textContent = "event log fetch failed";
+  }
+}
+
 async function pollLoop(){
   await poll();
-  setTimeout(pollLoop, 600);
+  await pollEvents();
+  setTimeout(pollLoop, 900);
 }
 loadSat();
+loadSmooth();
 pollLoop();
 </script>
 </body></html>
@@ -1635,7 +1715,7 @@ void handleStatus() {
   json += "\"fastMode\":" + String(fm ? "true" : "false") + ",";
   json += "\"pollMs\":" + String(pm) + ",";
   json += "\"issHttp\":" + String(httpc) + ",";
-  json += "\"issErr\":\"" + err + "\",";
+  json += "\"issErr\":\"" + jsonEscape(err) + "\",";
   json += "\"issAgeMs\":" + String(okMs == 0 ? 999999999UL : (millis() - okMs)) + ",";
   json += "\"timeSynced\":" + String(ts ? "true" : "false") + ",";
   json += "\"nowEpoch\":" + String(nowE) + ",";
@@ -1650,6 +1730,32 @@ void handleStatus() {
   json += "\"uptimeMs\":" + String(millis());
   json += "}";
   
+  server.send(200, "application/json", json);
+}
+
+
+void handleEvents() {
+  String json = "{\"events\":[";
+
+  char snapshot[EVENT_LOG_SIZE][EVENT_LOG_MSG_MAX];
+  uint8_t cnt = 0;
+
+  portENTER_CRITICAL(&dataMux);
+  uint8_t head = eventLogHead;
+  cnt = eventLogCount;
+  for (uint8_t i = 0; i < cnt; i++) {
+    uint8_t idx = (uint8_t)((head + EVENT_LOG_SIZE - cnt + i) % EVENT_LOG_SIZE);
+    strncpy(snapshot[i], eventLog[idx], EVENT_LOG_MSG_MAX - 1);
+    snapshot[i][EVENT_LOG_MSG_MAX - 1] = '\0';
+  }
+  portEXIT_CRITICAL(&dataMux);
+
+  for (uint8_t i = 0; i < cnt; i++) {
+    if (i > 0) json += ",";
+    json += "\"" + jsonEscape(String(snapshot[i])) + "\"";
+  }
+
+  json += "]}";
   server.send(200, "application/json", json);
 }
 
@@ -1692,8 +1798,11 @@ void handleObserverSet() {
   prefs.putDouble("obsLon", obsLonDeg);
   prefs.putDouble("obsAlt", obsAltM);
 
-  invalidateNextPassCache("observer changed");
-  ensureNextPass(true);
+  haveNextPass = false;
+  char msg[72];
+  snprintf(msg, sizeof(msg), "observer %.3f,%.3f alt=%.0f", obsLatDeg, obsLonDeg, obsAltM);
+  logEvent("OBS", msg);
+  logEvent("PASS", "invalidated due to observer change");
 
   sendOk("observer saved");
 }
@@ -1720,10 +1829,11 @@ void handleSatSet() {
   }
   trackedNoradId = (uint32_t)id;
   prefs.putUInt("trackedNoradId", trackedNoradId);
-
-  invalidateNextPassCache("satellite changed");
-  ensureNextPass(true);
-
+  haveNextPass = false;
+  char msg[72];
+  snprintf(msg, sizeof(msg), "sat change norad=%ld (%s)", id, satNameFor(trackedNoradId));
+  logEvent("SAT", msg);
+  logEvent("PASS", "invalidated due to sat change");
   sendOk("satellite set");
 }
 
@@ -1737,6 +1847,7 @@ void handleHome() {
   autoStartAfterHoming = false;
 
   startHoming();
+  logEvent("HOME", "manual homing started");
   sendOk("homing started");
 }
 
@@ -1747,6 +1858,7 @@ void handleSetNorth() {
   prefs.putLong("northOffset", (long)northOffsetSteps);
   hasNorthOffset = true;
   prefs.putBool("hasNorthOffset", true);
+  logEvent("HOME", "north offset set");
   sendOk("north offset saved");
 }
 
@@ -1822,6 +1934,7 @@ void handleTrackStart() {
   taskPollMs = ISS_POLL_SLOW_MS;
   portEXIT_CRITICAL(&dataMux);
 
+  logEvent("TRACK", "tracking started");
   sendOk("tracking enabled");
 }
 
@@ -1829,6 +1942,7 @@ void handleTrackStop() {
   trackingEnabled = false;
   manualOverride = true;
   stepper.stop();
+  logEvent("TRACK", "tracking stopped");
   sendOk("tracking disabled");
 }
 
@@ -1859,6 +1973,7 @@ void handleSmoothSet() {
   }
   smoothMotion = on;
   prefs.putBool("smoothMotion", smoothMotion);
+  logEvent("TRACK", smoothMotion ? "smooth motion ON" : "smooth motion OFF");
   handleSmoothGet();
 }
 void setup() {
@@ -1912,6 +2027,7 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/api/status", handleStatus);
+  server.on("/api/events", handleEvents);
   server.on("/api/observer", handleObserverGet);
   server.on("/api/observer/set", handleObserverSet);
   server.on("/api/sat", handleSatGet);
@@ -1938,7 +2054,7 @@ void setup() {
   autoStartAfterHoming = hasNorthOffset;
 
   startHoming();
-
+  logEvent("BOOT", "startup homing initiated");
 
   // Start ISS background task (Core 0 tends to keep WiFi happy; Core 1 runs loop/UI)
   xTaskCreatePinnedToCore(
@@ -1962,8 +2078,10 @@ void loop() {
   if (millis() - lastPassCheckMs > 5000) {
     lastPassCheckMs = millis();
     if (!haveNextPass) {
+      logEvent("PASS", "refresh requested: none cached");
       ensureNextPass(true);
     } else if (timeSynced && (int32_t)(nowEpoch() - nextPassMaxUTC) >= 0) {
+      logEvent("PASS", "refresh requested: cached pass expired");
       ensureNextPass(true);
     }
   }
@@ -1973,6 +2091,7 @@ void loop() {
     trackingEnabled = false;
     manualOverride = true;
     autoStartAfterHoming = false; // resume logic is handled by resumeTrackingAfterRehome
+    logEvent("FAULT", "hall drift -> rehome");
     startHoming();
   }
 
