@@ -32,6 +32,7 @@ static const char* OTA_HOSTNAME = "iss";
 static char wifiSsid[33] = "";
 static char wifiPass[65] = "";
 static char otaPassword[65] = "";
+static char n2yoApiKey[65] = "";
 
 // ---------------------- PINS ----------------------
 const int IN1 = 25;
@@ -108,7 +109,6 @@ double obsAltM    = OBS_ALT_DEFAULT_M;
 // ---------------------- N2YO API ----------------------
 // Used for next overhead pass estimates and live positions.
 static const char* N2YO_BASE = "https://api.n2yo.com/rest/v1/satellite";
-static const char* N2YO_API_KEY = "B2A452-X29HFK-647XCY-5NME";
 
 // ---------------------- SATELLITE SELECTION ----------------------
 // Default tracked satellite: ISS.
@@ -563,12 +563,16 @@ bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &maxAzOut, int
     err = String("WiFi not connected (mode=") + wifiModeString() + ", status=" + String((int)WiFi.status()) + ")";
     return false;
   }
+  if (!n2yoApiKey[0]) {
+    err = "N2YO key not set";
+    return false;
+  }
 
   // Build URL:
   // https://api.n2yo.com/rest/v1/satellite/visualpasses/{id}/{lat}/{lon}/{alt_m}/{days}/{min_visibility}/&apiKey={key}
   String url = String(N2YO_BASE) + "/visualpasses/" + String(trackedNoradId) + "/"+
                String(obsLatDeg, 6) + "/" + String(obsLonDeg, 6) + "/" +
-               String((int)lround(obsAltM)) + "/2/30/&apiKey=" + N2YO_API_KEY;
+               String((int)lround(obsAltM)) + "/2/30/&apiKey=" + String(n2yoApiKey);
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -658,6 +662,10 @@ static bool fetchPositionsN2YO(uint32_t noradId, uint8_t seconds,
     err = String("WiFi not connected (mode=") + wifiModeString() + ", status=" + String((int)WiFi.status()) + ")";
     return false;
   }
+  if (!n2yoApiKey[0]) {
+    err = "N2YO key not set";
+    return false;
+  }
   if (seconds < 1) seconds = 1;
   if (seconds > 60) seconds = 60;
 
@@ -665,7 +673,7 @@ static bool fetchPositionsN2YO(uint32_t noradId, uint8_t seconds,
   String url = String(N2YO_BASE) + "/positions/" + String(noradId) + "/" +
                String(obsLatDeg, 6) + "/" + String(obsLonDeg, 6) + "/" +
                String((int)lround(obsAltM)) + "/" + String((int)seconds) +
-               "/&apiKey=" + N2YO_API_KEY;
+               "/&apiKey=" + String(n2yoApiKey);
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -1093,6 +1101,33 @@ void updateOLED() {
   if (now - lastOledMs < 500) return;
   lastOledMs = now;
 
+  if (WiFi.getMode() == WIFI_AP || WiFi.status() != WL_CONNECTED) {
+    String apIp = WiFi.softAPIP().toString();
+    int x = 0;
+
+    oled.clearDisplay();
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setTextSize(1);
+
+    x = (OLED_W - ((int)strlen(AP_SSID) * 6)) / 2;
+    if (x < 0) x = 0;
+    oled.setCursor(x, 6);
+    oled.print(AP_SSID);
+
+    x = (OLED_W - ((int)strlen(AP_PASS) * 6)) / 2;
+    if (x < 0) x = 0;
+    oled.setCursor(x, 24);
+    oled.print(AP_PASS);
+
+    x = (OLED_W - ((int)apIp.length() * 6)) / 2;
+    if (x < 0) x = 0;
+    oled.setCursor(x, 42);
+    oled.print(apIp);
+
+    oled.display();
+    return;
+  }
+
   const char* state = uiStateLabel();
   const char* sat = satNameFor(trackedNoradId);
 
@@ -1264,14 +1299,18 @@ String htmlPage() {
     <label class="lbl">SSID</label>
     <input id="wifiSsid" class="text" style="min-width:220px" placeholder="Wi-Fi SSID">
     <label class="lbl">Wi-Fi Pass</label>
-    <input id="wifiPass" class="text" type="password" style="min-width:220px" placeholder="Leave blank to keep">
+    <input id="wifiPass" class="text" type="text" style="min-width:220px" placeholder="Wi-Fi password">
   </div>
   <div class="row" style="margin-top:8px">
     <label class="lbl">OTA Pass</label>
-    <input id="otaPass" class="text" type="password" style="min-width:220px" placeholder="Leave blank to keep">
+    <input id="otaPass" class="text" type="text" style="min-width:220px" placeholder="OTA password">
     <button class="small" onclick="saveNetwork()">Save &amp; Reboot</button>
   </div>
-  <div class="hint">If no Wi-Fi is saved, the tracker starts in fallback AP mode. Leave password fields blank to keep the current saved value.</div>
+  <div class="row" style="margin-top:8px">
+    <label class="lbl">N2YO Key</label>
+    <input id="n2yoKey" class="text" type="text" style="min-width:320px" placeholder="N2YO API key">
+  </div>
+  <div class="hint">If no Wi-Fi is saved, the tracker starts in fallback AP mode. Saved Wi-Fi, OTA, and N2YO credentials are shown here.</div>
 </div>
 
 <div class="card">
@@ -1340,9 +1379,11 @@ async function loadNetwork(){
     const ssid = document.getElementById('wifiSsid');
     const pass = document.getElementById('wifiPass');
     const ota = document.getElementById('otaPass');
+    const n2yo = document.getElementById('n2yoKey');
     if (ssid) ssid.value = j.ssid || '';
-    if (pass && j.hasWifiPass) pass.placeholder = 'Saved (leave blank to keep)';
-    if (ota && j.hasOtaPass) ota.placeholder = 'Saved (leave blank to keep)';
+    if (pass) pass.value = j.pass || '';
+    if (ota) ota.value = j.ota || '';
+    if (n2yo) n2yo.value = j.n2yo || '';
   }catch(e){}
 }
 
@@ -1350,6 +1391,8 @@ async function saveNetwork(){
   const ssid = document.getElementById('wifiSsid').value;
   const pass = document.getElementById('wifiPass').value;
   const ota = document.getElementById('otaPass').value;
+  const n2yo = document.getElementById('n2yoKey').value;
+  await fetch(`/api/n2yo/set?key=${encodeURIComponent(n2yo)}`);
   await fetch(`/api/network/set?ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}&ota=${encodeURIComponent(ota)}`);
   alert('Network settings saved. Device is rebooting.');
 }
@@ -1674,10 +1717,27 @@ void handleObserverSet() {
 void handleNetworkGet() {
   String json = "{";
   json += "\"ssid\":\"" + jsonEscape(String(wifiSsid)) + "\",";
-  json += "\"hasWifiPass\":" + String(wifiPass[0] ? "true" : "false") + ",";
-  json += "\"hasOtaPass\":" + String(otaPassword[0] ? "true" : "false");
+  json += "\"pass\":\"" + jsonEscape(String(wifiPass)) + "\",";
+  json += "\"ota\":\"" + jsonEscape(String(otaPassword)) + "\",";
+  json += "\"n2yo\":\"" + jsonEscape(String(n2yoApiKey)) + "\"";
   json += "}";
   server.send(200, "application/json", json);
+}
+
+void handleN2yoSet() {
+  String key = server.hasArg("key") ? server.arg("key") : String("");
+  key.trim();
+
+  if (key.length() > 64) {
+    server.send(400, "text/plain", "value too long");
+    return;
+  }
+
+  copyStringToBuf(key, n2yoApiKey, sizeof(n2yoApiKey));
+  prefs.putString("n2yoKey", String(n2yoApiKey));
+
+  logEvent("NET", n2yoApiKey[0] ? "N2YO key saved" : "N2YO key cleared");
+  server.send(200, "text/plain", "n2yo key saved");
 }
 
 void handleNetworkSet() {
@@ -1878,6 +1938,7 @@ void setup() {
   copyStringToBuf(prefs.getString("wifiSsid", ""), wifiSsid, sizeof(wifiSsid));
   copyStringToBuf(prefs.getString("wifiPass", ""), wifiPass, sizeof(wifiPass));
   copyStringToBuf(prefs.getString("otaPass", ""), otaPassword, sizeof(otaPassword));
+  copyStringToBuf(prefs.getString("n2yoKey", ""), n2yoApiKey, sizeof(n2yoApiKey));
   northOffsetSteps = prefs.getLong("northOffset", 0);
   hasNorthOffset = prefs.getBool("hasNorthOffset", false);
   isHomed = false; // always re-home on boot (latching hall has no absolute at power-up)
@@ -1925,6 +1986,7 @@ void setup() {
   server.on("/api/observer/set", handleObserverSet);
   server.on("/api/network", handleNetworkGet);
   server.on("/api/network/set", handleNetworkSet);
+  server.on("/api/n2yo/set", handleN2yoSet);
   server.on("/api/sat", handleSatGet);
   server.on("/api/sat/set", handleSatSet);
   server.on("/api/home", handleHome);
