@@ -24,14 +24,14 @@ struct PosSample {
 #include <WiFiClientSecure.h>
 
 // ---------------------- WIFI / OTA ----------------------
-static const char* WIFI_SSID = "reese-wlan";
-static const char* WIFI_PASS = "kjt94v28";
-
 static const char* AP_SSID = "ISS-Tracker";
 static const char* AP_PASS = "iss-tracker";
 
 static const char* OTA_HOSTNAME = "iss";
-static const char* OTA_PASSWORD = "F9jb76q2";
+
+static char wifiSsid[33] = "";
+static char wifiPass[65] = "";
+static char otaPassword[65] = "";
 
 // ---------------------- PINS ----------------------
 const int IN1 = 25;
@@ -296,6 +296,11 @@ String ipString() {
   return WiFi.localIP().toString();
 }
 
+static void copyStringToBuf(const String& src, char* dst, size_t dstSize) {
+  if (!dst || dstSize == 0) return;
+  src.toCharArray(dst, dstSize);
+  dst[dstSize - 1] = ' ';
+}
 
 // Minimal JSON string escaper (enough for /api/status payload)
 static String jsonEscape(const String& in) {
@@ -959,27 +964,33 @@ void updateTrackingMotion() {
 
 // ---------------------- WIFI / OTA ----------------------
 void startWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  if (wifiSsid[0]) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(OTA_HOSTNAME);
+    WiFi.begin(wifiSsid, wifiPass);
 
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) delay(200);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) delay(200);
 
-  if (WiFi.status() == WL_CONNECTED) return;
+    if (WiFi.status() == WL_CONNECTED) return;
 
-  WiFi.disconnect(true);
+    WiFi.disconnect(true);
+    delay(100);
+  }
+
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
 }
 
 void setupOTA() {
-  if (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED) {
-    if (MDNS.begin(OTA_HOSTNAME)) {
-      MDNS.addService("http", "tcp", 80);
-    }
+  if (MDNS.begin(OTA_HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
   }
+
   ArduinoOTA.setHostname(OTA_HOSTNAME);
-  ArduinoOTA.setPassword(OTA_PASSWORD);
+  if (otaPassword[0]) {
+    ArduinoOTA.setPassword(otaPassword);
+  }
 
   ArduinoOTA.onStart([]() {
     trackingEnabled = false;
@@ -1143,7 +1154,7 @@ void updateOLED() {
 // ---------------------- WEB UI ----------------------
 String htmlPage() {
   String s;
-  s.reserve(12000);
+  s.reserve(14000);
 
   s += R"HTML(
 <!doctype html><html>
@@ -1247,8 +1258,21 @@ String htmlPage() {
   </div>
 </div>
 
-
-
+<div class="card">
+  <h3>Network</h3>
+  <div class="row">
+    <label class="lbl">SSID</label>
+    <input id="wifiSsid" class="text" style="min-width:220px" placeholder="Wi-Fi SSID">
+    <label class="lbl">Wi-Fi Pass</label>
+    <input id="wifiPass" class="text" type="password" style="min-width:220px" placeholder="Leave blank to keep">
+  </div>
+  <div class="row" style="margin-top:8px">
+    <label class="lbl">OTA Pass</label>
+    <input id="otaPass" class="text" type="password" style="min-width:220px" placeholder="Leave blank to keep">
+    <button class="small" onclick="saveNetwork()">Save &amp; Reboot</button>
+  </div>
+  <div class="hint">If no Wi-Fi is saved, the tracker starts in fallback AP mode. Leave password fields blank to keep the current saved value.</div>
+</div>
 
 <div class="card">
   <h3>Satellite</h3>
@@ -1272,7 +1296,6 @@ String htmlPage() {
     <input id="satNorad" class="text" style="max-width:140px" placeholder="25544">
     <button class="small" onclick="setSat()">Set</button>
   </div>
-  <div class="hint">Stage 1: store the selected NORAD ID; Stage 2 will use it for tracking.</div>
 </div>
 
 <div class="card">
@@ -1308,6 +1331,27 @@ async function saveObserver(){
   await fetch(`/api/observer/set?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&alt=${encodeURIComponent(alt)}`);
   // Refresh status so the UI reflects new values immediately
   await poll();
+}
+
+async function loadNetwork(){
+  try{
+    const r = await fetch('/api/network');
+    const j = await r.json();
+    const ssid = document.getElementById('wifiSsid');
+    const pass = document.getElementById('wifiPass');
+    const ota = document.getElementById('otaPass');
+    if (ssid) ssid.value = j.ssid || '';
+    if (pass && j.hasWifiPass) pass.placeholder = 'Saved (leave blank to keep)';
+    if (ota && j.hasOtaPass) ota.placeholder = 'Saved (leave blank to keep)';
+  }catch(e){}
+}
+
+async function saveNetwork(){
+  const ssid = document.getElementById('wifiSsid').value;
+  const pass = document.getElementById('wifiPass').value;
+  const ota = document.getElementById('otaPass').value;
+  await fetch(`/api/network/set?ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}&ota=${encodeURIComponent(ota)}`);
+  alert('Network settings saved. Device is rebooting.');
 }
 
 async function loadSat(){
@@ -1450,6 +1494,7 @@ async function pollLoop(){
   await pollEvents();
   setTimeout(pollLoop, 900);
 }
+loadNetwork();
 loadSat();
 pollLoop();
 </script>
@@ -1626,8 +1671,54 @@ void handleObserverSet() {
   sendOk("observer saved");
 }
 
+void handleNetworkGet() {
+  String json = "{";
+  json += "\"ssid\":\"" + jsonEscape(String(wifiSsid)) + "\",";
+  json += "\"hasWifiPass\":" + String(wifiPass[0] ? "true" : "false") + ",";
+  json += "\"hasOtaPass\":" + String(otaPassword[0] ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
 
-// Satellite selection (Stage 1)
+void handleNetworkSet() {
+  String ssid = server.hasArg("ssid") ? server.arg("ssid") : String("");
+  String pass = server.hasArg("pass") ? server.arg("pass") : String("");
+  String ota  = server.hasArg("ota")  ? server.arg("ota")  : String("");
+  ssid.trim();
+
+  if (ssid.length() > 32 || pass.length() > 64 || ota.length() > 64) {
+    server.send(400, "text/plain", "value too long");
+    return;
+  }
+
+  copyStringToBuf(ssid, wifiSsid, sizeof(wifiSsid));
+  prefs.putString("wifiSsid", String(wifiSsid));
+
+  if (!wifiSsid[0]) {
+    wifiPass[0] = ' ';
+    prefs.putString("wifiPass", "");
+  } else if (pass.length() > 0) {
+    copyStringToBuf(pass, wifiPass, sizeof(wifiPass));
+    prefs.putString("wifiPass", String(wifiPass));
+  }
+
+  if (ota.length() > 0) {
+    copyStringToBuf(ota, otaPassword, sizeof(otaPassword));
+    prefs.putString("otaPass", String(otaPassword));
+  }
+
+  char msg[96];
+  snprintf(msg, sizeof(msg), "net save ssid=%s ota=%s",
+           wifiSsid[0] ? wifiSsid : "(ap only)",
+           otaPassword[0] ? "set" : "open");
+  logEvent("NET", msg);
+  server.send(200, "text/plain", "network saved; rebooting");
+  delay(400);
+  ESP.restart();
+}
+
+
+// Satellite selection
 void handleSatGet() {
   String json = "{";
   json += "\"id\":" + String(trackedNoradId) + ",";
@@ -1770,6 +1861,8 @@ void handleTrackStop() {
 // Forward declarations
 void handleObserverGet();
 void handleObserverSet();
+void handleNetworkGet();
+void handleNetworkSet();
 void handleSatGet();
 void handleSatSet();
 
@@ -1782,6 +1875,9 @@ void setup() {
   lastHallRaw = hallRaw();
 
   prefs.begin("isst", false);
+  copyStringToBuf(prefs.getString("wifiSsid", ""), wifiSsid, sizeof(wifiSsid));
+  copyStringToBuf(prefs.getString("wifiPass", ""), wifiPass, sizeof(wifiPass));
+  copyStringToBuf(prefs.getString("otaPass", ""), otaPassword, sizeof(otaPassword));
   northOffsetSteps = prefs.getLong("northOffset", 0);
   hasNorthOffset = prefs.getBool("hasNorthOffset", false);
   isHomed = false; // always re-home on boot (latching hall has no absolute at power-up)
@@ -1794,7 +1890,7 @@ void setup() {
   obsLatDeg = prefs.getDouble("obsLat", OBS_LAT_DEFAULT_DEG);
   obsLonDeg = prefs.getDouble("obsLon", OBS_LON_DEFAULT_DEG);
   obsAltM   = prefs.getDouble("obsAlt", OBS_ALT_DEFAULT_M);
-  // Load selected satellite (Stage 1: UI + status only)
+  // Load selected satellite
   trackedNoradId = prefs.getUInt("trackedNoradId", 25544);
 
 
@@ -1827,6 +1923,8 @@ void setup() {
   server.on("/api/events", handleEvents);
   server.on("/api/observer", handleObserverGet);
   server.on("/api/observer/set", handleObserverSet);
+  server.on("/api/network", handleNetworkGet);
+  server.on("/api/network/set", handleNetworkSet);
   server.on("/api/sat", handleSatGet);
   server.on("/api/sat/set", handleSatSet);
   server.on("/api/home", handleHome);
