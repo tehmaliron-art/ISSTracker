@@ -23,9 +23,6 @@ struct PosSample {
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 
-// ---------------------- MATH STRUCTS ----------------------
-struct Vec3 { double x, y, z; };
-
 // ---------------------- WIFI / OTA ----------------------
 static const char* WIFI_SSID = "reese-wlan";
 static const char* WIFI_PASS = "kjt94v28";
@@ -103,25 +100,23 @@ static const double OBS_LAT_DEFAULT_DEG = 35.3733;
 static const double OBS_LON_DEFAULT_DEG = -119.0187;
 static const double OBS_ALT_DEFAULT_M   = 120.0;
 
-// Runtime (mutable) observer location used by ISS tracking math.
+// Runtime (mutable) observer location used by N2YO requests.
 double obsLatDeg = OBS_LAT_DEFAULT_DEG;
 double obsLonDeg = OBS_LON_DEFAULT_DEG;
 double obsAltM    = OBS_ALT_DEFAULT_M;
 
-// ---------------------- ISS API ----------------------
-static const char* ISS_URL = "https://api.wheretheiss.at/v1/satellites/25544";
-
-// N2YO "visual passes" API (ISS NORAD id 25544). Used for next overhead pass estimates.
+// ---------------------- N2YO API ----------------------
+// Used for next overhead pass estimates and live positions.
 static const char* N2YO_BASE = "https://api.n2yo.com/rest/v1/satellite";
 static const char* N2YO_API_KEY = "B2A452-X29HFK-647XCY-5NME";
 
-// ---------------------- SATELLITE SELECTION (Stage 1: UI + status only) ----------------------
-// Default to ISS. Stage 2 will use this for live pointing.
+// ---------------------- SATELLITE SELECTION ----------------------
+// Default tracked satellite: ISS.
 static uint32_t trackedNoradId = 25544;
 
 
 // Tracking motion mode
-static bool smoothMotion = false; // if true, allow continuous retargeting (Stage 2)
+static bool smoothMotion = false; // if true, allow continuous retargeting
 static const char* satNameFor(uint32_t noradId) {
   switch (noradId) {
     case 25544: return "ISS";
@@ -140,10 +135,9 @@ static const char* satNameFor(uint32_t noradId) {
 
 
 // ---------------------- NETWORK TIMEOUTS ----------------------
-const uint32_t ISS_HTTP_TIMEOUT_MS = 500;  // your preference
-const uint32_t N2YO_HTTP_TIMEOUT_MS = 2500; // only fetched on boot / after pass
+const uint32_t N2YO_HTTP_TIMEOUT_MS = 2500; // fetched on boot / after pass and for positions
 
-// ---------------------- UNIX TIME (from ISS timestamp + millis) ----------------------
+// ---------------------- UNIX TIME (from N2YO timestamps + millis) ----------------------
 static bool timeSynced = false;
 static uint32_t timeBaseEpoch = 0;
 static uint32_t timeBaseMillis = 0;
@@ -159,20 +153,6 @@ static uint32_t nextPassMaxUTC = 0;
 static double nextPassMaxEl = 0.0;
 static int nextPassMaxAz = -1; // degrees, 0-359; -1 unknown
 static unsigned long lastN2yoFetchMs = 0;
-
-static void invalidateNextPassCache(const char* reason) {
-  haveNextPass = false;
-  nextPassMaxUTC = 0;
-  nextPassMaxEl = 0.0;
-  nextPassMaxAz = -1;
-  // Allow an immediate refetch when requested.
-  lastN2yoFetchMs = 0;
-  if (reason) {
-    Serial.printf("[PASS] Cache invalidated: %s\n", reason);
-  }
-}
-
-
 
 // Dynamic polling based on elevation (hysteresis)
 const uint32_t ISS_POLL_SLOW_MS = 2000;
@@ -552,60 +532,7 @@ void updateHoming() {
   }
 }
 
-// ---------------------- ISS MATH (ECEF -> ENU -> Az/El) ---------------------- (ECEF -> ENU -> Az/El) ----------------------
-static inline double deg2rad(double d) { return d * 0.017453292519943295; }
-static inline double rad2deg(double r) { return r * 57.29577951308232; }
-
-const double EARTH_RADIUS_M = 6371000.0;
-
-Vec3 llhToEcef(double latDeg, double lonDeg, double altM) {
-  double lat = deg2rad(latDeg);
-  double lon = deg2rad(lonDeg);
-  double r = EARTH_RADIUS_M + altM;
-
-  Vec3 v;
-  v.x = r * cos(lat) * cos(lon);
-  v.y = r * cos(lat) * sin(lon);
-  v.z = r * sin(lat);
-  return v;
-}
-
-Vec3 ecefToEnuDelta(const Vec3& d, double obsLatDeg, double obsLonDeg) {
-  double lat = deg2rad(obsLatDeg);
-  double lon = deg2rad(obsLonDeg);
-
-  double sinLat = sin(lat), cosLat = cos(lat);
-  double sinLon = sin(lon), cosLon = cos(lon);
-
-  Vec3 enu;
-  enu.x = -sinLon * d.x + cosLon * d.y;                                  // East
-  enu.y = -sinLat * cosLon * d.x - sinLat * sinLon * d.y + cosLat * d.z; // North
-  enu.z =  cosLat * cosLon * d.x + cosLat * sinLon * d.y + sinLat * d.z; // Up
-  return enu;
-}
-
-void computeAzElDeg(double obsLat, double obsLon, double obsAlt,
-                    double tgtLat, double tgtLon, double tgtAlt,
-                    double &azDegOut, double &elDegOut) {
-  Vec3 obs = llhToEcef(obsLat, obsLon, obsAlt);
-  Vec3 tgt = llhToEcef(tgtLat, tgtLon, tgtAlt);
-
-  Vec3 d{ tgt.x - obs.x, tgt.y - obs.y, tgt.z - obs.z };
-  Vec3 enu = ecefToEnuDelta(d, obsLat, obsLon);
-
-  double east  = enu.x;
-  double north = enu.y;
-  double up    = enu.z;
-
-  double az = atan2(east, north);
-  double horiz = sqrt(east*east + north*north);
-  double el = atan2(up, horiz);
-
-  azDegOut = wrap360(rad2deg(az));
-  elDegOut = rad2deg(el);
-}
-
-// ---------------------- ISS FETCH ----------------------
+// ---------------------- JSON HELPERS ----------------------
 bool extractJsonNumber(const String& body, const char* key, double &outVal) {
   String pattern = String("\"") + key + "\":";
   int idx = body.indexOf(pattern);
@@ -625,63 +552,6 @@ bool extractJsonNumber(const String& body, const char* key, double &outVal) {
   outVal = num.toDouble();
   return true;
 }
-
-bool fetchIssOnce(double &lat, double &lon, double &altM_out, int &httpCode, String &err) {
-  err = "";
-  httpCode = 0;
-
-  if (WiFi.getMode() != WIFI_STA || WiFi.status() != WL_CONNECTED) {
-    err = String("WiFi not connected (mode=") + wifiModeString() + ", status=" + String((int)WiFi.status()) + ")";
-    return false;
-  }
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(ISS_HTTP_TIMEOUT_MS);
-
-  HTTPClient http;
-  http.setTimeout(ISS_HTTP_TIMEOUT_MS);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-
-  if (!http.begin(client, ISS_URL)) {
-    err = "http.begin() failed";
-    return false;
-  }
-
-  int code = http.GET();
-  httpCode = code;
-
-  if (code <= 0) {
-    err = String("GET failed ") + code + " (" + httpErrorName(code) + "): " + http.errorToString(code);
-    http.end();
-    return false;
-  }
-  if (code != 200) {
-    err = String("HTTP ") + code;
-    http.end();
-    return false;
-  }
-
-  String body = http.getString();
-  http.end();
-
-  double aKm;
-  if (!extractJsonNumber(body, "latitude", lat))  { err = "parse latitude"; return false; }
-  if (!extractJsonNumber(body, "longitude", lon)) { err = "parse longitude"; return false; }
-  if (!extractJsonNumber(body, "altitude", aKm))  { err = "parse altitude"; return false; }
-
-  // Use ISS API timestamp as a lightweight Unix time source.
-  double ts = 0;
-  if (extractJsonNumber(body, "timestamp", ts) && ts > 0) {
-    timeBaseEpoch = (uint32_t)ts;
-    timeBaseMillis = millis();
-    timeSynced = true;
-  }
-
-  altM_out = aKm * 1000.0;
-  return true;
-}
-
 
 bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &maxAzOut, int &httpCode, String &err) {
   err = "";
