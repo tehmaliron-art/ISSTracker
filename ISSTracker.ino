@@ -114,9 +114,6 @@ static const char* N2YO_API_KEY = "B2A452-X29HFK-647XCY-5NME";
 // Default tracked satellite: ISS.
 static uint32_t trackedNoradId = 25544;
 
-
-// Tracking motion mode
-static bool smoothMotion = false; // if true, allow continuous retargeting
 static const char* satNameFor(uint32_t noradId) {
   switch (noradId) {
     case 25544: return "ISS";
@@ -925,7 +922,7 @@ void updateTrackingMotion() {
   bool pending = havePendingTarget;
   if (pending) {
     // Only commit a new target when we're close to finishing the current one
-    if (smoothMotion || labs(stepper.distanceToGo()) <= RETARGET_THRESHOLD_STEPS || stepper.distanceToGo() == 0) {
+    if (labs(stepper.distanceToGo()) <= RETARGET_THRESHOLD_STEPS || stepper.distanceToGo() == 0) {
       az = pendingAzDeg;
       el = pendingElDeg;
       havePendingTarget = false;
@@ -1274,8 +1271,6 @@ String htmlPage() {
     <label class="lbl">NORAD</label>
     <input id="satNorad" class="text" style="max-width:140px" placeholder="25544">
     <button class="small" onclick="setSat()">Set</button>
-    <label class="lbl" style="margin-left:14px">Smooth</label>
-    <input type="checkbox" id="smoothMotion" onclick="setSmooth()">
   </div>
   <div class="hint">Stage 1: store the selected NORAD ID; Stage 2 will use it for tracking.</div>
 </div>
@@ -1333,21 +1328,9 @@ async function loadSat(){
   }catch(e){}
 }
 
-async function loadSmooth(){
-  try{
-    const r = await fetch('/api/smooth');
-    const j = await r.json();
-    const cb = document.getElementById('smoothMotion');
-    if (cb) cb.checked = !!j.on;
-  }catch(e){}
-}
 
-async function setSmooth(){
-  const cb = document.getElementById('smoothMotion');
-  const on = (cb && cb.checked) ? 1 : 0;
-  await fetch('/api/smooth/set?on=' + on);
-  await poll();
-}
+
+
 
 
 function satPresetChanged(){
@@ -1364,7 +1347,6 @@ async function setSat(){
   if (!/^\d+$/.test(id)) { alert('Enter a numeric NORAD ID'); return; }
   await fetch('/api/sat/set?id=' + encodeURIComponent(id));
   await loadSat();
-  await loadSmooth();
   await poll();
 }
 
@@ -1469,7 +1451,6 @@ async function pollLoop(){
   setTimeout(pollLoop, 900);
 }
 loadSat();
-loadSmooth();
 pollLoop();
 </script>
 </body></html>
@@ -1793,27 +1774,6 @@ void handleSatGet();
 void handleSatSet();
 
 
-// -------------------------
-// Smooth motion API handlers (Stage 2)
-// -------------------------
-void handleSmoothGet() {
-  String json = String("{\"on\":") + (smoothMotion ? "true" : "false") + "}";
-  server.send(200, "application/json", json);
-}
-
-void handleSmoothSet() {
-  // expects on=0|1
-  bool on = false;
-  if (server.hasArg("on")) {
-    String v = server.arg("on");
-    v.toLowerCase();
-    on = (v == "1" || v == "true" || v == "on" || v == "yes");
-  }
-  smoothMotion = on;
-  prefs.putBool("smoothMotion", smoothMotion);
-  logEvent("TRACK", smoothMotion ? "smooth motion ON" : "smooth motion OFF");
-  handleSmoothGet();
-}
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -1836,7 +1796,6 @@ void setup() {
   obsAltM   = prefs.getDouble("obsAlt", OBS_ALT_DEFAULT_M);
   // Load selected satellite (Stage 1: UI + status only)
   trackedNoradId = prefs.getUInt("trackedNoradId", 25544);
-  smoothMotion = prefs.getBool("smoothMotion", false);
 
 
   stepper.setMaxSpeed(MOVE_SPEED);
@@ -1870,8 +1829,6 @@ void setup() {
   server.on("/api/observer/set", handleObserverSet);
   server.on("/api/sat", handleSatGet);
   server.on("/api/sat/set", handleSatSet);
-  server.on("/api/smooth", handleSmoothGet);
-  server.on("/api/smooth/set", handleSmoothSet);
   server.on("/api/home", handleHome);
   server.on("/api/set_north", handleSetNorth);
   server.on("/api/servo", handleServo);
