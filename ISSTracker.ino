@@ -30,7 +30,7 @@ static const char* WIFI_PASS = "kjt94v28";
 static const char* AP_SSID = "ISS-Tracker";
 static const char* AP_PASS = "iss-tracker";
 
-static const char* OTA_HOSTNAME = "iss-tracker";
+static const char* OTA_HOSTNAME = "iss";
 static const char* OTA_PASSWORD = "F9jb76q2";
 
 // ---------------------- PINS ----------------------
@@ -977,7 +977,9 @@ void startWiFi() {
 
 void setupOTA() {
   if (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED) {
-    MDNS.begin(OTA_HOSTNAME);
+    if (MDNS.begin(OTA_HOSTNAME)) {
+      MDNS.addService("http", "tcp", 80);
+    }
   }
   ArduinoOTA.setHostname(OTA_HOSTNAME);
   ArduinoOTA.setPassword(OTA_PASSWORD);
@@ -1071,7 +1073,7 @@ void setupOLED() {
 
 static const char* uiStateLabel() {
   if (homeState != ST_IDLE && homeState != ST_DONE && homeState != ST_FAIL) return "HOMING";
-  if (trackingEnabled && !manualOverride) return "TRACK";
+  if (trackingEnabled && !manualOverride) return "TRACKING";
   if (manualOverride) return "MANUAL";
   return "IDLE";
 }
@@ -1082,10 +1084,6 @@ void updateOLED() {
   unsigned long now = millis();
   if (now - lastOledMs < 500) return;
   lastOledMs = now;
-
-  String ipStr = (WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED)
-                   ? WiFi.localIP().toString()
-                   : WiFi.softAPIP().toString();
 
   const char* state = uiStateLabel();
   const char* sat = satNameFor(trackedNoradId);
@@ -1114,16 +1112,20 @@ void updateOLED() {
   oled.clearDisplay();
   oled.setTextColor(SSD1306_WHITE);
 
-  int ipSize = ((int)ipStr.length() * 12 <= OLED_W) ? 2 : 1;
-  int ipCharW = 6 * ipSize;
-  int stateY = (ipSize == 2) ? 16 : 12;
-  int satY = stateY + 18;
+  int satSize = ((int)strlen(sat) * 12 <= OLED_W) ? 2 : 1;
+  int nextSize = ((int)strlen(nextBuf) * 12 <= OLED_W) ? 2 : 1;
 
-  oled.setTextSize(ipSize);
-  int x = (OLED_W - ((int)ipStr.length() * ipCharW)) / 2;
+  int satH = 8 * satSize;
+  int stateY = satH + 4;
+  int nextY = stateY + 20;
+
+  int x = 0;
+
+  oled.setTextSize(satSize);
+  x = (OLED_W - ((int)strlen(sat) * 6 * satSize)) / 2;
   if (x < 0) x = 0;
   oled.setCursor(x, 0);
-  oled.print(ipStr);
+  oled.print(sat);
 
   oled.setTextSize(2);
   x = (OLED_W - ((int)strlen(state) * 12)) / 2;
@@ -1131,16 +1133,10 @@ void updateOLED() {
   oled.setCursor(x, stateY);
   oled.print(state);
 
-  oled.setTextSize(1);
-  x = (OLED_W - ((int)strlen(sat) * 6)) / 2;
+  oled.setTextSize(nextSize);
+  x = (OLED_W - ((int)strlen(nextBuf) * 6 * nextSize)) / 2;
   if (x < 0) x = 0;
-  oled.setCursor(x, satY);
-  oled.print(sat);
-
-  oled.setTextSize(2);
-  x = (OLED_W - ((int)strlen(nextBuf) * 12)) / 2;
-  if (x < 0) x = 0;
-  oled.setCursor(x, 46);
+  oled.setCursor(x, nextY);
   oled.print(nextBuf);
 
   oled.display();
