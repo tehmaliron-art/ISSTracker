@@ -150,6 +150,7 @@ static uint32_t nextPassMaxUTC = 0;
 static double nextPassMaxEl = 0.0;
 static int nextPassMaxAz = -1; // degrees, 0-359; -1 unknown
 static unsigned long lastN2yoFetchMs = 0;
+static unsigned long nextPassNoPassUntilMs = 0; // backoff when API reports no visible passes
 
 // Dynamic polling based on elevation (hysteresis)
 const uint32_t ISS_POLL_SLOW_MS = 2000;
@@ -604,6 +605,12 @@ bool fetchNextPassN2YO(uint32_t &maxUTCOut, double &maxElOut, int &maxAzOut, int
   String body = http.getString();
   http.end();
 
+  // If there are no visible passes within the requested window, treat it as a normal "TBD" case.
+  if (body.indexOf("\"passescount\":0") >= 0 || body.indexOf("\"passes\":[]") >= 0) {
+    err = "no passes";
+    return false;
+  }
+
   double maxUTC = 0;
   double maxEl = 0;
   double maxAz = 0;
@@ -773,6 +780,9 @@ void ensureNextPass(bool forceFetch) {
   // If forceFetch is requested (e.g., sat/observer changed), bypass this throttle.
   if (!forceFetch && (millis() - lastN2yoFetchMs < 60000)) return;
 
+  // Extra backoff when N2YO indicates there are no visible passes (common for low max elevation).
+  if (!forceFetch && nextPassNoPassUntilMs && (int32_t)(millis() - nextPassNoPassUntilMs) < 0) return;
+
   uint32_t maxUTC = 0;
   double maxEl = 0;
   int maxAz = -1;
@@ -796,10 +806,19 @@ void ensureNextPass(bool forceFetch) {
              timeSynced ? (long)((int32_t)nextPassMaxUTC - (int32_t)nowEpoch()) : -1L, nextPassMaxEl);
     logEvent("PASS", msg);
   } else {
-    Serial.printf("[PASS] N2YO fetch failed (HTTP %d): %s\n", code, err.c_str());
-    char msg[72];
-    snprintf(msg, sizeof(msg), "refresh fail http=%d %s", code, err.c_str());
-    logEvent("PASS", msg);
+    // Distinguish between true failures and "no visible passes" (which is normal for low max elevation).
+    bool noPass = (code == 200) && (err.startsWith("no passes") || err.indexOf("parse maxUTC") >= 0);
+    if (noPass) {
+      haveNextPass = false;
+      nextPassNoPassUntilMs = millis() + 3600000UL; // 1 hour backoff
+      logEvent("PASS", "no visible passes; backoff 1h");
+      Serial.printf("[PASS] N2YO returned no visible passes; backing off 1h\n");
+    } else {
+      Serial.printf("[PASS] N2YO fetch failed (HTTP %d): %s\n", code, err.c_str());
+      char msg[72];
+      snprintf(msg, sizeof(msg), "refresh fail http=%d %s", code, err.c_str());
+      logEvent("PASS", msg);
+    }
   }
 }
 
@@ -2034,18 +2053,6 @@ void loop() {
   server.handleClient();
   updateOLED();
 
-  // Refresh next-pass prediction only after the current one has happened.
-  static unsigned long lastPassCheckMs = 0;
-  if (millis() - lastPassCheckMs > 5000) {
-    lastPassCheckMs = millis();
-    if (!haveNextPass) {
-      logEvent("PASS", "refresh requested: none cached");
-      ensureNextPass(true);
-    } else if (timeSynced && (int32_t)(nowEpoch() - nextPassMaxUTC) >= 0) {
-      logEvent("PASS", "refresh requested: cached pass expired");
-      ensureNextPass(true);
-    }
-  }
 
   // If we detected drift while tracking, stop and re-home.
   if (rehomeRequested && (homeState == ST_IDLE || homeState == ST_DONE || homeState == ST_FAIL)) {
@@ -2070,4 +2077,17 @@ void loop() {
 
   // Always allow stepper to progress (jogs, etc.)
   stepper.run();
+
+  // Refresh next-pass prediction only after the current one has happened.
+  static unsigned long lastPassCheckMs = 0;
+  if (millis() - lastPassCheckMs > 5000) {
+    lastPassCheckMs = millis();
+    if (!haveNextPass) {
+      logEvent("PASS", "refresh requested: none cached");
+      ensureNextPass(false);
+    } else if (timeSynced && (int32_t)(nowEpoch() - nextPassMaxUTC) >= 0) {
+      logEvent("PASS", "refresh requested: cached pass expired");
+      ensureNextPass(false);
+    }
+  }
 }
