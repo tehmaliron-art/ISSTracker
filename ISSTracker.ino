@@ -173,6 +173,9 @@ volatile HomeState homeState = ST_IDLE;
 unsigned long phaseStartMs = 0;
 unsigned long phaseTimeoutMs = 0;
 
+// True while we are doing the initial boot-time homing pass (allows a longer timeout).
+bool bootHomingActive = false;
+
 volatile long northOffsetSteps = 0;
 volatile bool isHomed = false;
 volatile bool hasNorthOffset = false;
@@ -258,6 +261,8 @@ bool hallActive() {
   int v = hallRaw();
   return HALL_ACTIVE_LOW ? (v == LOW) : (v == HIGH);
 }
+
+unsigned long homingFudgeMs() { return bootHomingActive ? 20000UL : 5000UL; }
 
 void setPhaseTimeoutForRevs(float stepsPerSec, float revs, unsigned long fudgeMs = 5000) {
   if (stepsPerSec < 1.0f) stepsPerSec = 1.0f;
@@ -439,11 +444,11 @@ void startHoming() {
   // If we're already in RESET state (hallActive==false), skip directly to seeking HOME.
   if (!hallActive()) {
     homeState = ST_SEEK_INDEX;
-    setPhaseTimeoutForRevs(SEEK_SPEED, 1.1f, 5000);
+    setPhaseTimeoutForRevs(SEEK_SPEED, 1.1f, homingFudgeMs());
   } else {
     // We are in HOME band, so seek RESET first (<=90deg), then HOME.
     homeState = ST_SEEK_RESET;
-    setPhaseTimeoutForRevs(SEEK_SPEED, 0.5f, 5000);
+    setPhaseTimeoutForRevs(SEEK_SPEED, 0.5f, homingFudgeMs());
   }
 
   trackingEnabled = false;
@@ -457,6 +462,8 @@ void startHoming() {
 void finishHoming(bool success) {
   stepper.setSpeed(0);
   stepper.stop();
+
+  bootHomingActive = false;
 
   if (!success) {
     logEvent("HOME", "homing failed (timeout)");
@@ -517,7 +524,7 @@ void updateHoming() {
       // seek blue marker => hallActive()==false (raw HIGH)
       if (!hallActive()) {
         homeState = ST_SEEK_INDEX;
-        setPhaseTimeoutForRevs(SEEK_SPEED, 1.1f, 5000);
+        setPhaseTimeoutForRevs(SEEK_SPEED, 1.1f, homingFudgeMs());
       }
       break;
 
@@ -2033,6 +2040,7 @@ void setup() {
   resumeTrackingAfterRehome = false;
   autoStartAfterHoming = hasNorthOffset;
 
+  bootHomingActive = true;
   startHoming();
   logEvent("BOOT", "startup homing initiated");
 
@@ -2083,10 +2091,8 @@ void loop() {
   if (millis() - lastPassCheckMs > 5000) {
     lastPassCheckMs = millis();
     if (!haveNextPass) {
-      logEvent("PASS", "refresh requested: none cached");
       ensureNextPass(false);
     } else if (timeSynced && (int32_t)(nowEpoch() - nextPassMaxUTC) >= 0) {
-      logEvent("PASS", "refresh requested: cached pass expired");
       ensureNextPass(false);
     }
   }
