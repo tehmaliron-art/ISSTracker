@@ -57,8 +57,16 @@ const bool AZ_INVERT = true;
 const long RESET_OFFSET_STEPS = 1992;
 
 // Drift threshold: if we hit a hall landmark and we're off by more than this many steps,
-// stop tracking and re-home.
-const long HALL_DRIFT_THRESHOLD_STEPS = 150;
+// stop tracking and re-home. User-configurable via Web UI / API (stored in NVS).
+const long HALL_DRIFT_THRESHOLD_STEPS_DEFAULT = 150;
+volatile long hallDriftThresholdSteps = HALL_DRIFT_THRESHOLD_STEPS_DEFAULT;
+
+// Diagnostics for drift-triggered rehome
+volatile long lastHallDriftErrSteps = 0;
+volatile long lastHallDriftPosMod = 0;
+volatile long lastHallDriftExpMod = 0;
+volatile int  lastHallDriftToRaw = HIGH;
+volatile unsigned long lastHallDriftMs = 0;
 
 // homing
 const float SEEK_SPEED   = 350.0f;
@@ -411,10 +419,27 @@ void updateHallLandmarkSnap() {
 
   long err = wrapSignedSteps(posMod - expMod);
 
-  if (labs(err) > HALL_DRIFT_THRESHOLD_STEPS) {
+  // Capture diagnostics for UI/logging even if below threshold
+  lastHallDriftErrSteps = err;
+  lastHallDriftPosMod = posMod;
+  lastHallDriftExpMod = expMod;
+  lastHallDriftToRaw = to;
+  lastHallDriftMs = millis();
+
+  long thresh = (long)hallDriftThresholdSteps;
+  if (thresh < 10) thresh = 10;
+
+  if (labs(err) > thresh) {
     // Flag a re-home. The main loop will stop tracking and run the homing routine.
     rehomeRequested = true;
     resumeTrackingAfterRehome = true;
+
+    const char* lm = (to == LOW) ? "HOME" : "RESET";
+    double errDeg = ((double)err) / STEPS_PER_DEG;
+    char msg[96];
+    snprintf(msg, sizeof(msg), "hall drift %s err=%ld (%.1fdeg) thr=%ld pos=%ld exp=%ld",
+             lm, (long)err, errDeg, (long)thresh, (long)posMod, (long)expMod);
+    logEvent("FAULT", msg);
   }
 }
 
@@ -1340,6 +1365,16 @@ String htmlPage() {
 </div>
 
 <div class="card">
+  <h3>Homing / Drift</h3>
+  <div class="row">
+    <label class="lbl">Drift threshold (steps)</label>
+    <input id="driftThresh" class="text" style="max-width:140px" placeholder="150">
+    <button class="small" onclick="saveDrift()">Save</button>
+  </div>
+  <div class="hint">If drift at a hall landmark exceeds this threshold, tracking will stop and the unit will re-home.</div>
+</div>
+
+<div class="card">
   <h3>Satellite</h3>
   <div class="row">
     <label class="lbl">Preset</label>
@@ -1420,6 +1455,22 @@ async function saveNetwork(){
   const n2yo = document.getElementById('n2yoKey').value;
   await fetch(`/api/network/set?ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}&ota=${encodeURIComponent(ota)}&n2yo=${encodeURIComponent(n2yo)}`);
   alert('Settings saved. Device is rebooting.');
+}
+
+async function loadDrift(){
+  try{
+    const r = await fetch('/api/drift');
+    const j = await r.json();
+    const t = document.getElementById('driftThresh');
+    if (t) t.value = String(j.thresh || '');
+  }catch(e){}
+}
+
+async function saveDrift(){
+  const t = document.getElementById('driftThresh');
+  const v = (t ? t.value : '').trim();
+  if (!/^-?\d+$/.test(v)) { alert('Enter an integer step threshold'); return; }
+  await fetch('/api/drift/set?thresh=' + encodeURIComponent(v));
 }
 
 async function loadSat(){
@@ -1563,6 +1614,7 @@ async function pollLoop(){
   setTimeout(pollLoop, 900);
 }
 loadNetwork();
+loadDrift();
 loadSat();
 pollLoop();
 </script>
@@ -1630,6 +1682,11 @@ void handleStatus() {
   json += "\"homeState\":" + String((int)homeState) + ",";
   json += "\"hallRaw\":" + String(hallRaw()) + ",";
   json += "\"hallActive\":" + String(hallActive() ? "true" : "false") + ",";
+  json += "\"driftThresh\":" + String((long)hallDriftThresholdSteps) + ",";
+  json += "\"driftErrSteps\":" + String((long)lastHallDriftErrSteps) + ",";
+  json += "\"driftErrDeg\":" + String(((double)lastHallDriftErrSteps) / STEPS_PER_DEG, 2) + ",";
+  json += "\"driftToRaw\":" + String((int)lastHallDriftToRaw) + ",";
+  json += "\"driftAgeMs\":" + String(lastHallDriftMs == 0 ? 999999999UL : (millis() - lastHallDriftMs)) + ",";
   json += "\"azSteps\":" + String(steps) + ",";
   json += "\"azDeg\":" + String(azDeg, 4) + ",";
   json += "\"obsLat\":" + String(obsLatDeg, 6) + ",";
@@ -1665,6 +1722,25 @@ void handleStatus() {
   server.send(200, "application/json", json);
 }
 
+void handleDriftGet() {
+  String json = "{";
+  json += "\"thresh\":" + String((long)hallDriftThresholdSteps) + ",";
+  json += "\"errSteps\":" + String((long)lastHallDriftErrSteps) + ",";
+  json += "\"errDeg\":" + String(((double)lastHallDriftErrSteps) / STEPS_PER_DEG, 2) + ",";
+  json += "\"ageMs\":" + String(lastHallDriftMs == 0 ? 999999999UL : (millis() - lastHallDriftMs));
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleDriftSet() {
+  if (!server.hasArg("thresh")) { server.send(400, "text/plain", "missing thresh"); return; }
+  long v = server.arg("thresh").toInt();
+  if (v < 10) v = 10;
+  if (v > 2000) v = 2000;
+  hallDriftThresholdSteps = v;
+  prefs.putLong("hallDriftThr", (long)v);
+  server.send(200, "text/plain", "ok");
+}
 
 void handleEvents() {
   String json = "{\"events\":[";
@@ -1957,6 +2033,8 @@ void handleNetworkGet();
 void handleNetworkSet();
 void handleSatGet();
 void handleSatSet();
+void handleDriftGet();
+void handleDriftSet();
 
 
 void setup() {
@@ -1975,6 +2053,7 @@ void setup() {
   hasNorthOffset = prefs.getBool("hasNorthOffset", false);
   isHomed = false; // always re-home on boot (latching hall has no absolute at power-up)
   prefs.putBool("isHomed", false);
+  hallDriftThresholdSteps = prefs.getLong("hallDriftThr", HALL_DRIFT_THRESHOLD_STEPS_DEFAULT);
   servoAngle = prefs.getInt("servoAngle", 90);
   servoZeroDeg = prefs.getInt("servoZeroDeg", 90); // default level at 90°
 
@@ -2018,6 +2097,8 @@ void setup() {
   server.on("/api/observer/set", handleObserverSet);
   server.on("/api/network", handleNetworkGet);
   server.on("/api/network/set", handleNetworkSet);
+  server.on("/api/drift", handleDriftGet);
+  server.on("/api/drift/set", handleDriftSet);
   server.on("/api/n2yo/set", handleN2yoSet);
   server.on("/api/sat", handleSatGet);
   server.on("/api/sat/set", handleSatSet);
