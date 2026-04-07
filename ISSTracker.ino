@@ -408,18 +408,18 @@ void updateHallLandmarkSnap() {
   if (!isHomed || !hasNorthOffset) return;
   if (homeState != ST_IDLE && homeState != ST_DONE && homeState != ST_FAIL) return;
 
-  // Expected landmark positions are defined relative to HOME (red magnet) where raw becomes LOW (active=true).
-  // When raw transitions to LOW -> HOME landmark (expected mod position ~0).
-  // When raw transitions to HIGH -> RESET landmark (expected mod position ~RESET_OFFSET_STEPS).
-  long expected = (to == LOW) ? 0 : RESET_OFFSET_STEPS;
+  // Only sanity-check on HOME (raw LOW) crossings.
+  // Ignore RESET crossings entirely so drift checks do not depend on RESET_OFFSET_STEPS
+  // or the exact spacing/geometry of the second magnet.
+  if (to != LOW) return;
 
+  long expected = 0;
   long pos = stepper.currentPosition();
   long posMod = modSteps(pos);
   long expMod = modSteps(expected);
-
   long err = wrapSignedSteps(posMod - expMod);
 
-  // Capture diagnostics for UI/logging even if below threshold
+  // Capture HOME-crossing diagnostics for UI/status.
   lastHallDriftErrSteps = err;
   lastHallDriftPosMod = posMod;
   lastHallDriftExpMod = expMod;
@@ -434,11 +434,10 @@ void updateHallLandmarkSnap() {
     rehomeRequested = true;
     resumeTrackingAfterRehome = true;
 
-    const char* lm = (to == LOW) ? "HOME" : "RESET";
     double errDeg = ((double)err) / STEPS_PER_DEG;
     char msg[96];
-    snprintf(msg, sizeof(msg), "hall drift %s err=%ld (%.1fdeg) thr=%ld pos=%ld exp=%ld",
-             lm, (long)err, errDeg, (long)thresh, (long)posMod, (long)expMod);
+    snprintf(msg, sizeof(msg), "hall drift HOME err=%ld (%.1fdeg) thr=%ld pos=%ld exp=%ld",
+             (long)err, errDeg, (long)thresh, (long)posMod, (long)expMod);
     logEvent("FAULT", msg);
   }
 }
