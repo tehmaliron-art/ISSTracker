@@ -184,6 +184,13 @@ unsigned long phaseTimeoutMs = 0;
 // True while we are doing the initial boot-time homing pass (allows a longer timeout).
 bool bootHomingActive = false;
 
+// Homing diagnostics
+long homingStartPos = 0;
+long homingPhaseStartPos = 0;
+long homingResetSteps = 0;
+long homingIndexSteps = 0;
+int  homingStartRaw = HIGH;
+
 volatile long northOffsetSteps = 0;
 volatile bool isHomed = false;
 volatile bool hasNorthOffset = false;
@@ -429,6 +436,16 @@ void updateHallLandmarkSnap() {
   long thresh = (long)hallDriftThresholdSteps;
   if (thresh < 10) thresh = 10;
 
+  // Only use the HOME/zero crossing for drift sanity checks.
+  // Ignore RESET crossings so we do not depend on RESET_OFFSET_STEPS accuracy.
+  if (to != LOW) return;
+
+  double errDeg = ((double)err) / STEPS_PER_DEG;
+  char seenMsg[96];
+  snprintf(seenMsg, sizeof(seenMsg), "home seen err=%ld (%.1fdeg) thr=%ld pos=%ld",
+           (long)err, errDeg, (long)thresh, (long)posMod);
+  logEvent("HOME", seenMsg);
+
   if (labs(err) > thresh) {
     // Flag a re-home. The main loop will stop tracking and run the homing routine.
     rehomeRequested = true;
@@ -465,6 +482,12 @@ void startHoming() {
 
   lastHallRaw = hallRaw();
 
+  homingStartPos = stepper.currentPosition();
+  homingPhaseStartPos = homingStartPos;
+  homingResetSteps = 0;
+  homingIndexSteps = 0;
+  homingStartRaw = lastHallRaw;
+
   // If we're already in RESET state (hallActive==false), skip directly to seeking HOME.
   if (!hallActive()) {
     homeState = ST_SEEK_INDEX;
@@ -489,15 +512,30 @@ void finishHoming(bool success) {
 
   bootHomingActive = false;
 
+  long curPos = stepper.currentPosition();
+  long totalSteps = labs(curPos - homingStartPos);
+  long phaseSteps = labs(curPos - homingPhaseStartPos);
+  if (homeState == ST_SEEK_RESET) {
+    homingResetSteps = phaseSteps;
+  } else if (homeState == ST_SEEK_INDEX) {
+    homingIndexSteps = phaseSteps;
+  }
+
   if (!success) {
-    logEvent("HOME", "homing failed (timeout)");
+    char msg[120];
+    snprintf(msg, sizeof(msg), "homing failed total=%ld reset=%ld index=%ld startRaw=%d",
+             totalSteps, homingResetSteps, homingIndexSteps, homingStartRaw);
+    logEvent("HOME", msg);
     homeState = ST_FAIL;
     isHomed = false;
     prefs.putBool("isHomed", false);
     trackingEnabled = false;
     manualOverride = true;
   } else {
-    logEvent("HOME", "homing complete");
+    char msg[120];
+    snprintf(msg, sizeof(msg), "homing complete total=%ld reset=%ld index=%ld startRaw=%d",
+             totalSteps, homingResetSteps, homingIndexSteps, homingStartRaw);
+    logEvent("HOME", msg);
     homeState = ST_DONE;
     isHomed = true;
     prefs.putBool("isHomed", true);
@@ -547,6 +585,8 @@ void updateHoming() {
     case ST_SEEK_RESET:
       // seek blue marker => hallActive()==false (raw HIGH)
       if (!hallActive()) {
+        homingResetSteps = labs(stepper.currentPosition() - homingPhaseStartPos);
+        homingPhaseStartPos = stepper.currentPosition();
         homeState = ST_SEEK_INDEX;
         setPhaseTimeoutForRevs(SEEK_SPEED, 1.1f, homingFudgeMs());
       }
@@ -555,6 +595,7 @@ void updateHoming() {
     case ST_SEEK_INDEX:
       // seek red HOME marker => hallActive()==true (raw LOW)
       if (hallActive()) {
+        homingIndexSteps = labs(stepper.currentPosition() - homingPhaseStartPos);
         // define absolute zero at HOME
         stepper.setCurrentPosition(0);
         finishHoming(true);
