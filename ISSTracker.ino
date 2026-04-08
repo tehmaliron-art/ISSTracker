@@ -210,6 +210,8 @@ volatile bool manualOverride = false; // set true on any manual action; Start Tr
 volatile bool rehomeRequested = false;
 volatile bool resumeTrackingAfterRehome = false;
 volatile bool autoStartAfterHoming = false;
+volatile bool pauseOnDriftFault = false;
+volatile bool driftFaultPaused = false;
 
 // Background task shared data
 portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
@@ -1409,9 +1411,11 @@ String htmlPage() {
   <div class="row">
     <label class="lbl">Drift threshold (steps)</label>
     <input id="driftThresh" class="text" style="max-width:140px" placeholder="150">
+    <label class="lbl" style="min-width:auto">Pause on drift</label>
+    <input type="checkbox" id="pauseOnDriftFault">
     <button class="small" onclick="saveDrift()">Save</button>
   </div>
-  <div class="hint">If drift at a hall landmark exceeds this threshold, tracking will stop and the unit will re-home.</div>
+  <div class="hint">If enabled, a drift fault pauses tracking for inspection instead of auto-homing.</div>
 </div>
 
 <div class="card">
@@ -1502,15 +1506,20 @@ async function loadDrift(){
     const r = await fetch('/api/drift');
     const j = await r.json();
     const t = document.getElementById('driftThresh');
+    const p = document.getElementById('pauseOnDriftFault');
     if (t) t.value = String(j.thresh || '');
+    if (p) p.checked = !!j.pauseOnDrift;
   }catch(e){}
 }
 
 async function saveDrift(){
   const t = document.getElementById('driftThresh');
+  const p = document.getElementById('pauseOnDriftFault');
   const v = (t ? t.value : '').trim();
+  const pause = (p && p.checked) ? 1 : 0;
   if (!/^-?\d+$/.test(v)) { alert('Enter an integer step threshold'); return; }
-  await fetch('/api/drift/set?thresh=' + encodeURIComponent(v));
+  await fetch('/api/drift/set?thresh=' + encodeURIComponent(v) + '&pause=' + pause);
+  await poll();
 }
 
 async function loadSat(){
@@ -1579,6 +1588,7 @@ function renderStatus(j){
   left.push(`<b>Tracking:</b> ${j.tracking}`);
   left.push(`<b>Ready:</b> ${j.ready} ${(!j.ready ? '(Home + Set North required)' : '')}`);
   left.push(`<b>ManualOverride:</b> ${j.manualOverride}`);
+  left.push(`<b>DriftPause:</b> ${j.pauseOnDriftFault} &nbsp; <b>Paused:</b> ${j.driftFaultPaused}`);
   left.push(`<b>Homed:</b> ${j.homed} &nbsp; <b>HomeState:</b> ${j.homeState}`);
   left.push(`<b>Hall:</b> raw=${j.hallRaw} active=${j.hallActive}`);
   left.push(`<b>Az deg (north-ref):</b> ${Number(j.azDeg).toFixed(2)}&deg;`);
@@ -1722,6 +1732,8 @@ void handleStatus() {
   json += "\"homeState\":" + String((int)homeState) + ",";
   json += "\"hallRaw\":" + String(hallRaw()) + ",";
   json += "\"hallActive\":" + String(hallActive() ? "true" : "false") + ",";
+  json += "\"pauseOnDriftFault\":" + String(pauseOnDriftFault ? "true" : "false") + ",";
+  json += "\"driftFaultPaused\":" + String(driftFaultPaused ? "true" : "false") + ",";
   json += "\"driftThresh\":" + String((long)hallDriftThresholdSteps) + ",";
   json += "\"driftErrSteps\":" + String((long)lastHallDriftErrSteps) + ",";
   json += "\"driftErrDeg\":" + String(((double)lastHallDriftErrSteps) / STEPS_PER_DEG, 2) + ",";
@@ -1765,6 +1777,8 @@ void handleStatus() {
 void handleDriftGet() {
   String json = "{";
   json += "\"thresh\":" + String((long)hallDriftThresholdSteps) + ",";
+  json += "\"pauseOnDrift\":" + String(pauseOnDriftFault ? "true" : "false") + ",";
+  json += "\"paused\":" + String(driftFaultPaused ? "true" : "false") + ",";
   json += "\"errSteps\":" + String((long)lastHallDriftErrSteps) + ",";
   json += "\"errDeg\":" + String(((double)lastHallDriftErrSteps) / STEPS_PER_DEG, 2) + ",";
   json += "\"ageMs\":" + String(lastHallDriftMs == 0 ? 999999999UL : (millis() - lastHallDriftMs));
@@ -1773,12 +1787,17 @@ void handleDriftGet() {
 }
 
 void handleDriftSet() {
-  if (!server.hasArg("thresh")) { server.send(400, "text/plain", "missing thresh"); return; }
-  long v = server.arg("thresh").toInt();
-  if (v < 10) v = 10;
-  if (v > 2000) v = 2000;
-  hallDriftThresholdSteps = v;
-  prefs.putLong("hallDriftThr", (long)v);
+  if (server.hasArg("thresh")) {
+    long v = server.arg("thresh").toInt();
+    if (v < 10) v = 10;
+    if (v > 2000) v = 2000;
+    hallDriftThresholdSteps = v;
+    prefs.putLong("hallDriftThr", (long)v);
+  }
+  if (server.hasArg("pause")) {
+    pauseOnDriftFault = server.arg("pause").toInt() != 0;
+    prefs.putBool("pauseDrift", pauseOnDriftFault);
+  }
   server.send(200, "text/plain", "ok");
 }
 
@@ -1963,6 +1982,7 @@ void handleHome() {
   rehomeRequested = false;
   resumeTrackingAfterRehome = false;
   autoStartAfterHoming = false;
+  driftFaultPaused = false;
 
   startHoming();
   logEvent("HOME", "manual homing started");
@@ -2044,6 +2064,7 @@ void handleTrackStart() {
 
   manualOverride = false;
   trackingEnabled = true;
+  driftFaultPaused = false;
 
   portENTER_CRITICAL(&dataMux);
   havePendingTarget = false;
@@ -2094,6 +2115,7 @@ void setup() {
   isHomed = false; // always re-home on boot (latching hall has no absolute at power-up)
   prefs.putBool("isHomed", false);
   hallDriftThresholdSteps = prefs.getLong("hallDriftThr", HALL_DRIFT_THRESHOLD_STEPS_DEFAULT);
+  pauseOnDriftFault = prefs.getBool("pauseDrift", false);
   servoAngle = prefs.getInt("servoAngle", 90);
   servoZeroDeg = prefs.getInt("servoZeroDeg", 90); // default level at 90°
 
@@ -2188,8 +2210,16 @@ void loop() {
     trackingEnabled = false;
     manualOverride = true;
     autoStartAfterHoming = false; // resume logic is handled by resumeTrackingAfterRehome
-    logEvent("FAULT", "hall drift -> rehome");
-    startHoming();
+    if (pauseOnDriftFault) {
+      driftFaultPaused = true;
+      rehomeRequested = false;
+      resumeTrackingAfterRehome = false;
+      logEvent("FAULT", "hall drift -> pause");
+    } else {
+      driftFaultPaused = false;
+      logEvent("FAULT", "hall drift -> rehome");
+      startHoming();
+    }
   }
 
   // Homing mode
