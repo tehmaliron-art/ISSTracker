@@ -190,6 +190,11 @@ long homingPhaseStartPos = 0;
 long homingResetSteps = 0;
 long homingIndexSteps = 0;
 int  homingStartRaw = HIGH;
+// Only trust HOME crossings when approached in the same direction used
+// by the CCW-only homing pass. Opposite-direction crossings trip on the
+// other edge of the magnetic field and can look falsely offset.
+const int HOME_CHECK_DIR = +1;
+
 
 volatile long northOffsetSteps = 0;
 volatile bool isHomed = false;
@@ -442,21 +447,29 @@ void updateHallLandmarkSnap() {
   // Ignore RESET crossings so we do not depend on RESET_OFFSET_STEPS accuracy.
   if (to != LOW) return;
 
+  int dir = 0;
+  if (stepper.distanceToGo() > 0) dir = +1;
+  else if (stepper.distanceToGo() < 0) dir = -1;
+
   double errDeg = ((double)err) / STEPS_PER_DEG;
-  char seenMsg[96];
-  snprintf(seenMsg, sizeof(seenMsg), "home seen err=%ld (%.1fdeg) thr=%ld pos=%ld",
-           (long)err, errDeg, (long)thresh, (long)posMod);
+  char seenMsg[112];
+  snprintf(seenMsg, sizeof(seenMsg), "home seen err=%ld (%.1fdeg) thr=%ld pos=%ld dir=%+d",
+           (long)err, errDeg, (long)thresh, (long)posMod, dir);
   logEvent("HOME", seenMsg);
+
+  if (dir != HOME_CHECK_DIR) {
+    logEvent("HOME", "home crossing ignored (opposite direction)");
+    return;
+  }
 
   if (labs(err) > thresh) {
     // Flag a re-home. The main loop will stop tracking and run the homing routine.
     rehomeRequested = true;
     resumeTrackingAfterRehome = true;
 
-    double errDeg = ((double)err) / STEPS_PER_DEG;
-    char msg[96];
-    snprintf(msg, sizeof(msg), "hall drift HOME err=%ld (%.1fdeg) thr=%ld pos=%ld exp=%ld",
-             (long)err, errDeg, (long)thresh, (long)posMod, (long)expMod);
+    char msg[112];
+    snprintf(msg, sizeof(msg), "hall drift HOME err=%ld (%.1fdeg) thr=%ld pos=%ld exp=%ld dir=%+d",
+             (long)err, errDeg, (long)thresh, (long)posMod, (long)expMod, dir);
     logEvent("FAULT", msg);
   }
 }
