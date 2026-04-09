@@ -194,6 +194,8 @@ int  homingStartRaw = HIGH;
 // by the CCW-only homing pass. Opposite-direction crossings trip on the
 // other edge of the magnetic field and can look falsely offset.
 const int HOME_CHECK_DIR = +1;
+long lastHallSamplePos = 0;
+bool lastHallSamplePosValid = false;
 
 
 volatile long northOffsetSteps = 0;
@@ -410,6 +412,17 @@ void updateHallLandmarkSnap() {
   // NOTE: despite the name, this function no longer "snaps" the stepper origin.
   // With a latching hall sensor, snapping during tracking causes reference-frame jumps.
   // We only use hall transitions to detect drift and trigger a re-home if needed.
+  long pos = stepper.currentPosition();
+  int dir = 0;
+  long deltaPos = 0;
+  if (lastHallSamplePosValid) {
+    deltaPos = pos - lastHallSamplePos;
+    if (deltaPos > 0) dir = +1;
+    else if (deltaPos < 0) dir = -1;
+  }
+  lastHallSamplePos = pos;
+  lastHallSamplePosValid = true;
+
   int h = hallRaw();
   if (h == lastHallRaw) return;
 
@@ -428,7 +441,6 @@ void updateHallLandmarkSnap() {
   if (to != LOW) return;
 
   long expected = 0;
-  long pos = stepper.currentPosition();
   long posMod = modSteps(pos);
   long expMod = modSteps(expected);
   long err = wrapSignedSteps(posMod - expMod);
@@ -443,22 +455,23 @@ void updateHallLandmarkSnap() {
   long thresh = (long)hallDriftThresholdSteps;
   if (thresh < 10) thresh = 10;
 
-  // Only use the HOME/zero crossing for drift sanity checks.
-  // Ignore RESET crossings so we do not depend on RESET_OFFSET_STEPS accuracy.
-  if (to != LOW) return;
-
-  int dir = 0;
-  if (stepper.distanceToGo() > 0) dir = +1;
-  else if (stepper.distanceToGo() < 0) dir = -1;
+  const char* dirLabel = (dir > 0) ? "CCW" : ((dir < 0) ? "CW" : "?");
 
   double errDeg = ((double)err) / STEPS_PER_DEG;
-  char seenMsg[112];
-  snprintf(seenMsg, sizeof(seenMsg), "home seen err=%ld (%.1fdeg) thr=%ld pos=%ld dir=%+d",
-           (long)err, errDeg, (long)thresh, (long)posMod, dir);
+  char seenMsg[128];
+  snprintf(seenMsg, sizeof(seenMsg), "home seen err=%ld (%.1fdeg) thr=%ld pos=%ld dir=%s d=%ld",
+           (long)err, errDeg, (long)thresh, (long)posMod, dirLabel, (long)deltaPos);
   logEvent("HOME", seenMsg);
 
+  if (dir == 0) {
+    logEvent("HOME", "home crossing ignored (unknown direction)");
+    return;
+  }
+
   if (dir != HOME_CHECK_DIR) {
-    logEvent("HOME", "home crossing ignored (opposite direction)");
+    char msg[96];
+    snprintf(msg, sizeof(msg), "home crossing ignored (opposite direction dir=%s)", dirLabel);
+    logEvent("HOME", msg);
     return;
   }
 
@@ -467,13 +480,12 @@ void updateHallLandmarkSnap() {
     rehomeRequested = true;
     resumeTrackingAfterRehome = true;
 
-    char msg[112];
-    snprintf(msg, sizeof(msg), "hall drift HOME err=%ld (%.1fdeg) thr=%ld pos=%ld exp=%ld dir=%+d",
-             (long)err, errDeg, (long)thresh, (long)posMod, (long)expMod, dir);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "hall drift HOME err=%ld (%.1fdeg) thr=%ld pos=%ld exp=%ld dir=%s d=%ld",
+             (long)err, errDeg, (long)thresh, (long)posMod, (long)expMod, dirLabel, (long)deltaPos);
     logEvent("FAULT", msg);
   }
 }
-
 
 // ---------------------- HOMING (LATCHING HALL, CCW ONLY) ----------------------
 // Confirmed hardware mapping (per Robert):
@@ -496,6 +508,8 @@ void startHoming() {
   stepper.setSpeed(SEEK_SPEED); // CCW (per existing build wiring)
 
   lastHallRaw = hallRaw();
+  lastHallSamplePos = stepper.currentPosition();
+  lastHallSamplePosValid = true;
 
   homingStartPos = stepper.currentPosition();
   homingPhaseStartPos = homingStartPos;
@@ -2077,6 +2091,8 @@ void handleTrackStart() {
 
   manualOverride = false;
   trackingEnabled = true;
+  lastHallSamplePos = stepper.currentPosition();
+  lastHallSamplePosValid = true;
   driftFaultPaused = false;
 
   portENTER_CRITICAL(&dataMux);
