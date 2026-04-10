@@ -196,6 +196,7 @@ int  homingStartRaw = HIGH;
 const int HOME_CHECK_DIR = +1;
 long lastHallSamplePos = 0;
 bool lastHallSamplePosValid = false;
+int lastHallMotionDir = 0;  // +1/-1 based on last non-zero azimuth movement
 
 
 volatile long northOffsetSteps = 0;
@@ -413,13 +414,13 @@ void updateHallLandmarkSnap() {
   // With a latching hall sensor, snapping during tracking causes reference-frame jumps.
   // We only use hall transitions to detect drift and trigger a re-home if needed.
   long pos = stepper.currentPosition();
-  int dir = 0;
   long deltaPos = 0;
   if (lastHallSamplePosValid) {
     deltaPos = pos - lastHallSamplePos;
-    if (deltaPos > 0) dir = +1;
-    else if (deltaPos < 0) dir = -1;
+    if (deltaPos > 0) lastHallMotionDir = +1;
+    else if (deltaPos < 0) lastHallMotionDir = -1;
   }
+  int dir = lastHallMotionDir;
   lastHallSamplePos = pos;
   lastHallSamplePosValid = true;
 
@@ -510,6 +511,7 @@ void startHoming() {
   lastHallRaw = hallRaw();
   lastHallSamplePos = stepper.currentPosition();
   lastHallSamplePosValid = true;
+  lastHallMotionDir = 0;
 
   homingStartPos = stepper.currentPosition();
   homingPhaseStartPos = homingStartPos;
@@ -2093,6 +2095,7 @@ void handleTrackStart() {
   trackingEnabled = true;
   lastHallSamplePos = stepper.currentPosition();
   lastHallSamplePosValid = true;
+  lastHallMotionDir = 0;
   driftFaultPaused = false;
 
   portENTER_CRITICAL(&dataMux);
