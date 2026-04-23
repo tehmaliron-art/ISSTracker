@@ -141,6 +141,8 @@ static const char* satNameFor(uint32_t noradId) {
 
 // ---------------------- NETWORK TIMEOUTS ----------------------
 const uint32_t N2YO_HTTP_TIMEOUT_MS = 2500; // fetched on boot / after pass and for positions
+const uint32_t WIFI_RECONNECT_RETRY_MS = 10000;
+const uint32_t WIFI_REBOOT_AFTER_MS = 60000;
 
 // ---------------------- UNIX TIME (from N2YO timestamps + millis) ----------------------
 static bool timeSynced = false;
@@ -246,6 +248,11 @@ volatile bool fastMode = false;      // hysteresis state
 volatile uint32_t taskPollMs = 0;    // for UI debugging
 
 TaskHandle_t issTaskHandle = nullptr;
+
+// Wi-Fi runtime recovery
+static unsigned long wifiDisconnectedSinceMs = 0;
+static unsigned long lastWifiReconnectAttemptMs = 0;
+static bool wifiDisconnectLogged = false;
 
 void logEvent(const char* tag, const char* msg) {
   char line[EVENT_LOG_MSG_MAX];
@@ -1112,6 +1119,49 @@ void startWiFi() {
   WiFi.softAP(AP_SSID, AP_PASS);
 }
 
+void handleWiFiRecovery() {
+  if (!wifiSsid[0]) return; // no saved STA config; AP fallback is expected
+  if (WiFi.getMode() == WIFI_AP) return; // boot-time AP fallback; leave it alone until reboot/manual config
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wifiDisconnectedSinceMs != 0) {
+      char msg[72];
+      snprintf(msg, sizeof(msg), "STA recovered ip=%s", WiFi.localIP().toString().c_str());
+      logEvent("WIFI", msg);
+    }
+    wifiDisconnectedSinceMs = 0;
+    lastWifiReconnectAttemptMs = 0;
+    wifiDisconnectLogged = false;
+    return;
+  }
+
+  unsigned long now = millis();
+  if (wifiDisconnectedSinceMs == 0) {
+    wifiDisconnectedSinceMs = now;
+  }
+  if (!wifiDisconnectLogged) {
+    logEvent("WIFI", "STA lost; attempting reconnect");
+    wifiDisconnectLogged = true;
+  }
+
+  if ((now - wifiDisconnectedSinceMs) >= WIFI_REBOOT_AFTER_MS) {
+    logEvent("WIFI", "STA reconnect timeout; rebooting");
+    delay(200);
+    ESP.restart();
+    return;
+  }
+
+  if (lastWifiReconnectAttemptMs == 0 || (now - lastWifiReconnectAttemptMs) >= WIFI_RECONNECT_RETRY_MS) {
+    lastWifiReconnectAttemptMs = now;
+    WiFi.disconnect(false, false);
+    delay(50);
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(OTA_HOSTNAME);
+    WiFi.begin(wifiSsid, wifiPass);
+    logEvent("WIFI", "STA reconnect attempt");
+  }
+}
+
 void setupOTA() {
   if (MDNS.begin(OTA_HOSTNAME)) {
     MDNS.addService("http", "tcp", 80);
@@ -1223,7 +1273,7 @@ void updateOLED() {
   if (now - lastOledMs < 500) return;
   lastOledMs = now;
 
-  if (WiFi.getMode() == WIFI_AP || WiFi.status() != WL_CONNECTED) {
+  if (WiFi.getMode() == WIFI_AP) {
     String apIp = WiFi.softAPIP().toString();
     int x = 0;
 
@@ -1245,6 +1295,38 @@ void updateOLED() {
     if (x < 0) x = 0;
     oled.setCursor(x, 42);
     oled.print(apIp);
+
+    oled.display();
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    String ssid = wifiSsid[0] ? String(wifiSsid) : String("(no ssid)");
+    unsigned long lostMs = wifiDisconnectedSinceMs ? (millis() - wifiDisconnectedSinceMs) : 0;
+    unsigned long leftMs = (lostMs >= WIFI_REBOOT_AFTER_MS) ? 0 : (WIFI_REBOOT_AFTER_MS - lostMs);
+    char rebootBuf[20];
+    snprintf(rebootBuf, sizeof(rebootBuf), "Reboot %lus", leftMs / 1000UL);
+    int x = 0;
+
+    oled.clearDisplay();
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setTextSize(1);
+
+    const char* line1 = "WiFi Lost";
+    x = (OLED_W - ((int)strlen(line1) * 6)) / 2;
+    if (x < 0) x = 0;
+    oled.setCursor(x, 6);
+    oled.print(line1);
+
+    x = (OLED_W - ((int)ssid.length() * 6)) / 2;
+    if (x < 0) x = 0;
+    oled.setCursor(x, 24);
+    oled.print(ssid);
+
+    x = (OLED_W - ((int)strlen(rebootBuf) * 6)) / 2;
+    if (x < 0) x = 0;
+    oled.setCursor(x, 42);
+    oled.print(rebootBuf);
 
     oled.display();
     return;
@@ -1750,6 +1832,7 @@ void handleStatus() {
   json += "\"wifiMode\":\"" + wifiModeString() + "\",";
   json += "\"ip\":\"" + ipString() + "\",";
   json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"wifiDisconnectedMs\":" + String(wifiDisconnectedSinceMs == 0 ? 0UL : (millis() - wifiDisconnectedSinceMs)) + ",";
   json += "\"otaHost\":\"" + String(OTA_HOSTNAME) + "\",";
   json += "\"tracking\":" + String(trackingEnabled ? "true" : "false") + ",";
   json += "\"manualOverride\":" + String(manualOverride ? "true" : "false") + ",";
@@ -2234,6 +2317,7 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
+  handleWiFiRecovery();
   updateOLED();
 
 
